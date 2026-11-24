@@ -1,1111 +1,1523 @@
-import importlib.util
-import itertools
+from datetime import date
+import importlib
+from importlib.util import module_from_spec, spec_from_file_location
+import html
 import os
-import re
-from datetime import datetime, timedelta, timezone
-
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+import harville_calculator
 
-st.set_page_config(
-    page_title="JRA KEIBA AI",
-    layout="wide",
-    initial_sidebar_state="expanded",
+importlib.reload(harville_calculator)
+from harville_calculator import (
+    build_budget_mode_tickets,
+    build_trio_strategies,
+    calculate_exacta_probabilities,
+    calculate_horse_place_probs,
+    calculate_pair_probabilities,
+    calculate_trio_probabilities,
 )
 
-JST = timezone(timedelta(hours=9))
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "keiba_lgbm.pkl")
-UPCOMING_CSV = os.path.join(BASE_DIR, "data", "upcoming_race.csv")
-HIST_CSV = os.path.join(BASE_DIR, "data", "historical_races.csv")
-BETS_CSV = os.path.join(BASE_DIR, "data", "bet_history.csv")
+# 各種モジュールを読み込み
+spec_train = spec_from_file_location("train_model", "02_train_model.py")
+train_model = module_from_spec(spec_train)
+spec_train.loader.exec_module(train_model)
 
+spec_scraper = spec_from_file_location("shutuba_scraper", "06_shutuba_scraper.py")
+shutuba_scraper = module_from_spec(spec_scraper)
+spec_scraper.loader.exec_module(shutuba_scraper)
 
-def _load_local_module(module_name: str, filename: str):
-    file_path = os.path.join(BASE_DIR, filename)
-    if not os.path.exists(file_path):
-        return None
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+spec_tracker = spec_from_file_location("bet_tracker", "07_bet_tracker.py")
+bet_tracker = module_from_spec(spec_tracker)
+spec_tracker.loader.exec_module(bet_tracker)
 
+st.set_page_config(page_title="JRA KEIBA AI | 期待値＆買い目シミュレーター", layout="wide")
 
-train_mod = _load_local_module("train_model", "02_train_model.py")
-shutuba_scraper = _load_local_module("shutuba_scraper", "06_shutuba_scraper.py")
-bet_tracker = _load_local_module("bet_tracker", "07_bet_tracker.py")
-harville_mod = _load_local_module("harville_calculator", "harville_calculator.py")
-
-
-# ---------------------------------------------------------
-# スタイル定義（クリーン・テキスト重視・絵文字なし）
-# ---------------------------------------------------------
+# ==============================================================================
+# カスタムCSS（開催馬場ピルボタン・前R/次Rボタン・買い目タイル・出走表）
+# ==============================================================================
 st.markdown(
     """
 <style>
-    .block-container {
-        padding-top: 1.1rem;
-        padding-bottom: 2.5rem;
-        max-width: 1220px;
-    }
-    .top-navbar {
-        background: linear-gradient(90deg, #0d192e 0%, #162642 100%);
-        color: #ffffff;
-        padding: 14px 22px;
-        border-radius: 10px;
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: space-between;
-        align-items: center;
-        gap: 10px;
-        margin-bottom: 14px;
-        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.14);
-    }
-    .top-navbar-title {
-        font-size: 1.32rem;
-        font-weight: 800;
-        letter-spacing: 0.05em;
-        color: #ffffff;
-    }
-    .nav-badges {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
-    }
-    .badge-green {
-        background-color: #15803d;
-        color: #ffffff;
-        padding: 5px 12px;
-        border-radius: 6px;
-        font-size: 0.82rem;
-        font-weight: 700;
-    }
-    .badge-warn {
-        background-color: #b45309;
-        color: #ffffff;
-        padding: 5px 12px;
-        border-radius: 6px;
-        font-size: 0.82rem;
-        font-weight: 700;
-    }
-    .badge-slate {
-        background-color: #293852;
-        color: #e2e8f0;
-        padding: 5px 12px;
-        border-radius: 6px;
-        font-size: 0.82rem;
-        font-weight: 600;
-        border: 1px solid #3c4f70;
-    }
-    .race-banner {
-        background: linear-gradient(135deg, #2b1035 0%, #441950 100%);
-        color: #ffffff;
-        padding: 20px 26px;
-        border-radius: 12px;
-        display: flex;
-        flex-wrap: wrap;
-        justify-content: space-between;
-        align-items: center;
-        gap: 16px;
-        margin-top: 8px;
-        margin-bottom: 18px;
-        box-shadow: 0 4px 14px rgba(43, 16, 53, 0.22);
-    }
-    .race-banner-sub {
-        font-size: 1.02rem;
-        font-weight: 700;
-        color: #f3e8ff;
-        margin-bottom: 4px;
-    }
-    .race-banner-time {
-        font-size: 0.86rem;
-        font-weight: 500;
-        color: #d8b4fe;
-        margin-left: 8px;
-    }
-    .race-banner-title {
-        font-size: 1.55rem;
-        font-weight: 800;
-        color: #ffffff;
-        line-height: 1.25;
-        margin-bottom: 10px;
-    }
-    .race-banner-meta {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 10px;
-        font-size: 0.88rem;
-        color: #f3e8ff;
-    }
-    .cond-pill {
-        background-color: #fde68a;
-        color: #78350f;
-        font-weight: 800;
-        padding: 2px 10px;
-        border-radius: 5px;
-        font-size: 0.82rem;
-    }
-    .status-pill {
-        background-color: rgba(236, 253, 245, 0.95);
-        color: #065f46;
-        border: 1px solid #34d399;
-        font-weight: 700;
-        padding: 2px 10px;
-        border-radius: 5px;
-        font-size: 0.82rem;
-    }
-    .gauge-group {
-        display: flex;
-        gap: 14px;
-        align-items: center;
-    }
-    .ring-box {
-        width: 74px;
-        height: 74px;
-        border-radius: 50%;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        align-items: center;
-        background: rgba(15, 10, 25, 0.38);
-    }
-    .ring-orange {
-        border: 3.5px solid #f59e0b;
-    }
-    .ring-green {
-        border: 3.5px solid #10b981;
-    }
-    .ring-val-orange {
-        font-size: 1.12rem;
-        font-weight: 800;
-        color: #fbbf24;
-        line-height: 1.1;
-    }
-    .ring-val-green {
-        font-size: 1.12rem;
-        font-weight: 800;
-        color: #34d399;
-        line-height: 1.1;
-    }
-    .ring-label {
-        font-size: 0.68rem;
-        color: #e9d5ff;
-        margin-top: 2px;
-        font-weight: 600;
-    }
-    .section-heading {
-        font-size: 1.08rem;
-        font-weight: 800;
-        color: #1e293b;
-        border-left: 4px solid #3b82f6;
-        padding-left: 10px;
-        margin: 16px 0 10px 0;
-    }
+.stApp {
+    background-color: #f4f6f9;
+}
+.block-container {
+    padding-top: 3.8rem !important;
+    padding-bottom: 2.5rem;
+    max-width: 1320px;
+}
+div[data-testid="stDeployButton"] {
+    display: none;
+}
+
+/* トップナビゲーションバー */
+.top-navbar {
+    background-color: #16213e;
+    color: #ffffff;
+    padding: 12px 22px;
+    border-radius: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.top-navbar .brand {
+    font-size: 1.25rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    color: #ffffff;
+}
+.top-navbar .nav-badges {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 0.8rem;
+    flex-wrap: wrap;
+}
+.nav-pill {
+    background-color: rgba(255,255,255,0.14);
+    padding: 4px 11px;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-weight: 600;
+}
+.nav-pill-warn {
+    background-color: #b45309;
+    padding: 4px 11px;
+    border-radius: 6px;
+    color: #ffffff;
+    font-weight: 700;
+}
+.nav-pill-real {
+    background-color: #047857;
+    padding: 4px 11px;
+    border-radius: 6px;
+    color: #ffffff;
+    font-weight: 700;
+}
+
+/* 開催馬場＆レース移動ピルボタン（写真スタイル準拠） */
+.venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button,
+.race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
+    min-height: 40px !important;
+    height: 40px !important;
+    border-radius: 8px !important;
+    padding: 4px 10px !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important;
+    transition: all 0.12s ease-in-out !important;
+}
+.venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"],
+.race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"] {
+    background-color: #ffffff !important;
+    border: 1.5px solid #cbd5e1 !important;
+    color: #1e293b !important;
+}
+.venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover,
+.race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover {
+    border-color: #192442 !important;
+    background-color: #f1f5f9 !important;
+}
+.venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"],
+.race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"] {
+    background-color: #192442 !important;
+    border: 1.5px solid #192442 !important;
+    color: #ffffff !important;
+}
+.venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p,
+.race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p {
+    font-size: 0.92rem !important;
+    font-weight: 700 !important;
+    white-space: nowrap !important;
+}
+
+/* レースヘッダーバナー */
+.race-banner {
+    background: linear-gradient(135deg, #4a154b 0%, #611f54 60%, #3b123c 100%);
+    color: #ffffff;
+    border-radius: 12px;
+    padding: 18px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 6px;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 12px rgba(74, 21, 75, 0.25);
+}
+.race-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 4px;
+}
+.race-venue-r {
+    font-size: 1.25rem;
+    font-weight: 800;
+}
+.race-time {
+    font-size: 0.88rem;
+    color: #e9d5ff;
+}
+.race-name-main {
+    font-size: 1.45rem;
+    font-weight: 800;
+    margin: 2px 0 8px 0;
+    letter-spacing: 0.02em;
+}
+.race-meta-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+}
+.cond-badge {
+    background-color: #fde68a;
+    color: #78350f;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+}
+.status-badge {
+    background-color: #ecfdf5;
+    color: #047857;
+    border: 1px solid #10b981;
+    font-weight: 700;
+    padding: 2px 10px;
+    border-radius: 5px;
+    font-size: 0.78rem;
+}
+
+/* 右側リングスコア */
+.ring-group {
+    display: flex;
+    gap: 14px;
+}
+.ring-circle {
+    width: 68px;
+    height: 68px;
+    border-radius: 50%;
+    background: rgba(20, 12, 28, 0.55);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    box-shadow: inset 0 0 8px rgba(0,0,0,0.4);
+}
+.ring-orange { border: 3.5px solid #f59e0b; }
+.ring-green { border: 3.5px solid #10b981; }
+.ring-num-orange {
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #fbbf24;
+    line-height: 1.1;
+}
+.ring-num-green {
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #34d399;
+    line-height: 1.1;
+}
+.ring-label {
+    font-size: 0.68rem;
+    color: #f3e8ff;
+    margin-top: 2px;
+}
+
+/* モード選択タイルボタン専用ラッパー */
+.mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
+    min-height: 84px !important;
+    border-radius: 12px !important;
+    padding: 12px 16px !important;
+    transition: all 0.15s ease-in-out !important;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08) !important;
+}
+.mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"] {
+    background-color: #ffffff !important;
+    border: 2px solid #cbd5e1 !important;
+    color: #1e293b !important;
+}
+.mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover {
+    border-color: #4a154b !important;
+    background-color: #fdf4ff !important;
+    transform: translateY(-2px);
+}
+.mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"] {
+    background: linear-gradient(135deg, #192442 0%, #4a154b 100%) !important;
+    border: 2.5px solid #4a154b !important;
+    color: #ffffff !important;
+    box-shadow: 0 4px 12px rgba(74, 21, 75, 0.3) !important;
+}
+.mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p {
+    font-size: 1.45rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.04em !important;
+}
+
+/* 出走表カスタムテーブル */
+.shutuba-wrapper {
+    background: #ffffff;
+    border-radius: 10px;
+    overflow-x: auto;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    border: 1px solid #e2e8f0;
+    margin-bottom: 20px;
+}
+.shutuba-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    text-align: center;
+}
+.shutuba-table thead th {
+    background-color: #192442;
+    color: #ffffff;
+    font-weight: 600;
+    padding: 10px 8px;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    border-bottom: 2px solid #0f172a;
+}
+.shutuba-table tbody tr {
+    border-bottom: 1px solid #e2e8f0;
+    transition: background-color 0.15s;
+}
+.shutuba-table tbody tr:hover {
+    filter: brightness(0.97);
+}
+.row-rank-1 { background-color: #fdf2f2; }
+.row-rank-2 { background-color: #fff8eb; }
+.row-rank-3 { background-color: #f8fafc; }
+.shutuba-table td {
+    padding: 9px 8px;
+    vertical-align: middle;
+}
+
+/* JRA 8色枠番丸バッジ */
+.waku-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    font-weight: 800;
+    font-size: 0.85rem;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+}
+.waku-1 { background: #ffffff; color: #111827; border: 1.5px solid #9ca3af; }
+.waku-2 { background: #1f2937; color: #ffffff; }
+.waku-3 { background: #dc2626; color: #ffffff; }
+.waku-4 { background: #2563eb; color: #ffffff; }
+.waku-5 { background: #eab308; color: #111827; }
+.waku-6 { background: #16a34a; color: #ffffff; }
+.waku-7 { background: #f97316; color: #ffffff; }
+.waku-8 { background: #ec4899; color: #ffffff; }
+
+/* 馬番＆印 */
+.umaban-txt { font-weight: 800; font-size: 1.02rem; }
+.umaban-top { color: #dc2626; }
+.mark-badge { font-weight: 900; font-size: 1.05rem; color: #dc2626; }
+
+/* オッズ＆人気2段 */
+.pop-tag { font-size: 0.72rem; color: #2563eb; font-weight: 600; line-height: 1.1; }
+.odds-val { font-size: 1.02rem; font-weight: 800; color: #111827; line-height: 1.2; }
+
+/* 馬名＆騎手2段 */
+.horse-cell { text-align: left !important; padding-left: 12px !important; }
+.horse-title { font-weight: 800; font-size: 0.96rem; color: #1d4ed8; line-height: 1.25; }
+.jockey-sub { font-size: 0.76rem; color: #64748b; margin-top: 2px; }
+
+/* シグナルバッジ */
+.sig-axis {
+    background-color: #dc2626;
+    color: #ffffff;
+    font-weight: 800;
+    font-size: 0.76rem;
+    padding: 3px 12px;
+    border-radius: 5px;
+    display: inline-block;
+}
+.sig-value {
+    background-color: #fff7ed;
+    color: #c2410c;
+    border: 1px solid #f97316;
+    font-weight: 800;
+    font-size: 0.76rem;
+    padding: 2px 10px;
+    border-radius: 5px;
+    display: inline-block;
+}
+.sig-himo {
+    background-color: #ffffff;
+    color: #2563eb;
+    border: 1px solid #93c5fd;
+    font-weight: 700;
+    font-size: 0.76rem;
+    padding: 2px 10px;
+    border-radius: 5px;
+    display: inline-block;
+}
+.sig-wait {
+    background-color: #f8fafc;
+    color: #64748b;
+    border: 1px solid #cbd5e1;
+    font-weight: 600;
+    font-size: 0.76rem;
+    padding: 2px 10px;
+    border-radius: 5px;
+    display: inline-block;
+}
+
+/* 信頼度ランク */
+.conf-s { color: #dc2626; font-weight: 900; font-size: 1.05rem; }
+.conf-a { color: #dc2626; font-weight: 800; font-size: 1.0rem; }
+.conf-b { color: #d97706; font-weight: 800; font-size: 0.95rem; }
+.conf-none { color: #94a3b8; font-weight: 600; }
+
+/* 能力値＆プログレスバー */
+.ability-wrap { display: inline-flex; align-items: center; gap: 8px; justify-content: center; }
+.ability-num { font-weight: 800; font-size: 0.92rem; min-width: 36px; text-align: right; }
+.bar-bg { width: 58px; height: 8px; background-color: #e2e8f0; border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 4px; }
+
+/* 確率カラム */
+.prob-hot { color: #dc2626; font-weight: 800; }
+.prob-warm { color: #ea580c; font-weight: 700; }
+.prob-norm { color: #1e293b; font-weight: 600; }
+
+/* 買い目モードカード */
+.bet-card {
+    background: #ffffff;
+    border-left: 5px solid #4a154b;
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-top: 10px;
+    margin-bottom: 12px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+}
+.bet-card-title {
+    font-size: 1.04rem;
+    font-weight: 800;
+    color: #192442;
+    margin-bottom: 8px;
+}
+.horse-chip {
+    display: inline-block;
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    padding: 3px 10px;
+    margin: 2px 5px 2px 0;
+    font-weight: 700;
+    font-size: 0.86rem;
+    color: #0f172a;
+}
+.horse-chip-axis {
+    background: #fef2f2;
+    border-color: #fca5a5;
+    color: #b91c1c;
+}
+
+/* ヘルプ画面カード */
+.help-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 18px 22px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+}
+.help-card h4 {
+    color: #192442;
+    margin-top: 0;
+    margin-bottom: 10px;
+    padding-bottom: 6px;
+    border-bottom: 2px solid #4a154b;
+    font-weight: 800;
+}
+.help-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin-top: 8px;
+}
+.help-table th {
+    background-color: #f1f5f9;
+    color: #192442;
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid #cbd5e1;
+    width: 24%;
+}
+.help-table td {
+    padding: 8px 12px;
+    border: 1px solid #e2e8f0;
+    color: #334155;
+    line-height: 1.5;
+}
+.formula-box {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-left: 4px solid #192442;
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-family: Consolas, monospace;
+    font-size: 0.88rem;
+    color: #0f172a;
+    margin: 8px 0;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
-# ---------------------------------------------------------
-# モデル読み込み＆学習状態判定
-# ---------------------------------------------------------
 @st.cache_resource
-def load_artifact() -> dict | None:
-    if not os.path.exists(MODEL_PATH):
-        return None
-    return joblib.load(MODEL_PATH)
+def load_artifact():
+    return joblib.load("models/keiba_lgbm.pkl")
 
 
 @st.cache_data(ttl=30)
-def get_training_data_status(_artifact: dict | None = None) -> dict:
-    if os.path.exists(HIST_CSV):
-        try:
-            df_h = pd.read_csv(HIST_CSV, usecols=["race_id", "date", "horse_name"])
-            sample_ratio = df_h["horse_name"].astype(str).str.startswith("サンプルホース").mean()
-            n_races = int(df_h["race_id"].nunique())
-            min_d = str(df_h["date"].min())
-            max_d = str(df_h["date"].max())
-            if sample_ratio > 0.5:
-                return {
-                    "is_real": False,
-                    "badge": "学習元: テスト用サンプルデータ",
-                    "detail": f"仮想データ（{n_races:,}レース / {min_d} - {max_d}）で学習しています。",
-                }
+def get_training_data_status() -> dict:
+    hist_path = "data/historical_races.csv"
+    if not os.path.exists(hist_path):
+        return {
+            "is_real": False,
+            "badge": "学習データ未確認",
+            "detail": "data/historical_races.csv が見つかりません。",
+        }
+    try:
+        df_h = pd.read_csv(hist_path, usecols=["race_id", "date", "horse_name"])
+        sample_ratio = df_h["horse_name"].astype(str).str.startswith("サンプルホース").mean()
+        n_races = int(df_h["race_id"].nunique())
+        min_d = str(df_h["date"].min())
+        max_d = str(df_h["date"].max())
+        if sample_ratio > 0.5:
             return {
-                "is_real": True,
-                "badge": f"学習元: JRA実データ ({n_races:,}R)",
-                "detail": f"実際のJRA過去レース結果（{n_races:,}レース / 期間: {min_d} - {max_d}）を使用して学習しています。",
+                "is_real": False,
+                "badge": "学習元: テスト用サンプルデータ",
+                "detail": f"現在は 01_data_loader.py で生成した仮想データ（{n_races:,}レース / {min_d} 〜 {max_d}）で学習しています。",
             }
-        except Exception:
-            pass
+        return {
+            "is_real": True,
+            "badge": f"学習元: JRA実データ ({n_races:,}R)",
+            "detail": f"実際のJRA過去レース結果（{n_races:,}レース / 期間: {min_d} 〜 {max_d}）を使用して学習しています。",
+        }
+    except Exception:
+        return {
+            "is_real": False,
+            "badge": "学習元: 確認中",
+            "detail": "学習データの種別を確認できませんでした。",
+        }
 
-    if _artifact and isinstance(_artifact, dict):
-        jockeys = [str(j) for j in _artifact.get("category_maps", {}).get("jockey_id", [])]
-        real_jockeys = [
-            j for j in jockeys
-            if not j.startswith("JOCKEY_") and j not in ("UNKNOWN_J", "UNKNOWN", "nan", "")
-        ]
-        if len(real_jockeys) >= 20:
-            n_r = _artifact.get("n_races")
-            badge_txt = f"学習元: JRA実データ ({int(n_r):,}R)" if n_r else "学習元: JRA実データモデル適用中"
-            return {
-                "is_real": True,
-                "badge": badge_txt,
-                "detail": "JRA実レース結果で学習済みのモデル（models/keiba_lgbm.pkl）を読み込んで予測しています。",
-            }
 
-    return {
-        "is_real": False,
-        "badge": "学習データ未確認",
-        "detail": "models/keiba_lgbm.pkl を確認してください。",
-    }
+def load_race_into_session(race_item: dict, date_str: str):
+    """指定されたレースアイテム（race_id, venue, race_num）の出馬表と全オッズを取得してセッションに反映"""
+    bundle = shutuba_scraper.fetch_shutuba_and_odds(
+        race_id=race_item["race_id"],
+        date_str=date_str,
+    )
+    scraped_df = bundle["shutuba_df"]
+    os.makedirs("data", exist_ok=True)
+    scraped_df.to_csv("data/upcoming_race.csv", index=False)
+
+    st.session_state["active_race_df"] = scraped_df
+    st.session_state["auto_pair_odds_df"] = bundle["pair_odds_df"]
+    st.session_state["auto_exacta_odds_df"] = bundle["exacta_odds_df"]
+    st.session_state["auto_trio_odds_df"] = bundle["trio_odds_df"]
+    st.session_state["selected_venue"] = race_item["venue"]
+    st.session_state["selected_race_id"] = race_item["race_id"]
+    st.session_state["odds_status_label"] = (
+        "全券種実オッズ取得済"
+        if bundle["has_real_multi"]
+        else ("単勝実オッズ取得済" if bundle["has_real_win"] else "発売前仮オッズ")
+    )
 
 
 artifact = load_artifact()
-if artifact is None:
-    st.error("学習済みモデル（models/keiba_lgbm.pkl）が見つかりません。先に 02_train_model.py を実行してください。")
-    st.stop()
-
 model = artifact["model"]
 feature_cols = artifact["feature_cols"]
 category_maps = artifact["category_maps"]
-train_status = get_training_data_status(artifact)
+train_status = get_training_data_status()
 
+# ==============================================================================
+# サイドバー：開催日＆レース取得・設定
+# ==============================================================================
+st.sidebar.header("1. 開催日・データ取得")
+data_source = st.sidebar.radio(
+    "データ取得方法",
+    ["WebからJRA出馬表・オッズを自動取得", "ローカル / CSVアップロード"],
+)
 
-# ---------------------------------------------------------
-# 特徴量生成フォールバック（02_train_model.py と完全互換）
-# ---------------------------------------------------------
-def _fallback_create_features(df: pd.DataFrame, cmaps: dict) -> tuple[pd.DataFrame, dict]:
-    out = df.copy()
-    num_defaults = {
-        "prev1_rank": 7.0,
-        "prev2_rank": 7.0,
-        "prev3_rank": 7.0,
-        "prev1_time_diff": 0.8,
-        "distance": 1800.0,
-        "frame_num": 4.0,
-        "horse_num": 8.0,
-        "weight_carried": 56.0,
-        "horse_weight": 476.0,
-        "weight_diff": 0.0,
-    }
-    for col, default_val in num_defaults.items():
-        if col not in out.columns:
-            out[col] = default_val
-        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default_val)
-
-    out["avg_prev_rank"] = (out["prev1_rank"] + out["prev2_rank"] + out["prev3_rank"]) / 3.0
-    out["best_prev_rank"] = out[["prev1_rank", "prev2_rank", "prev3_rank"]].min(axis=1)
-    out["rank_trend"] = out["prev3_rank"] - out["prev1_rank"]
-
-    if "race_id" in out.columns:
-        race_avg_rank = out.groupby("race_id")["avg_prev_rank"].transform("mean")
-        race_avg_tdiff = out.groupby("race_id")["prev1_time_diff"].transform("mean")
-    else:
-        race_avg_rank = out["avg_prev_rank"].mean()
-        race_avg_tdiff = out["prev1_time_diff"].mean()
-
-    out["rel_prev_rank"] = out["avg_prev_rank"] - race_avg_rank
-    out["rel_time_diff"] = out["prev1_time_diff"] - race_avg_tdiff
-
-    safe_hw = np.clip(out["horse_weight"].to_numpy(dtype=float), 350.0, 650.0)
-    out["abs_weight_diff"] = out["weight_diff"].abs()
-    out["weight_ratio"] = out["weight_carried"] / safe_hw
-
-    cat_cols = ["venue", "surface", "track_condition", "jockey_id", "trainer_id"]
-    for col in cat_cols:
-        if col not in out.columns:
-            out[col] = "UNKNOWN"
-        s = out[col].fillna("UNKNOWN").astype(str).str.strip().replace("", "UNKNOWN")
-        top_cats = cmaps.get(col, ["OTHER"])
-        s_mapped = s.where(s.isin(top_cats), "OTHER")
-        out[col] = pd.Categorical(s_mapped, categories=top_cats)
-
-    return out, cmaps
-
-
-# ---------------------------------------------------------
-# ハービル確率・期待値・買い目生成エンジン
-# ---------------------------------------------------------
-def compute_harville_probabilities(win_probs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """ハービル公式により各馬の連対率(2着以内)・複勝率(3着以内)を厳密計算する"""
-    n = len(win_probs)
-    p = np.clip(np.asarray(win_probs, dtype=float), 1e-6, 1.0)
-    p = p / p.sum()
-
-    quinella_prob = p.copy()
-    place_prob = p.copy()
-
-    if n < 2:
-        return quinella_prob, place_prob
-
-    for j in range(n):
-        p2_j = 0.0
-        for i in range(n):
-            if i == j:
-                continue
-            denom1 = max(1e-6, 1.0 - p[i])
-            p2_j += p[i] * (p[j] / denom1)
-        quinella_prob[j] = p[j] + p2_j
-
-    if n < 3:
-        return quinella_prob, quinella_prob.copy()
-
-    for k in range(n):
-        p3_k = 0.0
-        for i in range(n):
-            if i == k:
-                continue
-            denom1 = max(1e-6, 1.0 - p[i])
-            for j in range(n):
-                if j == i or j == k:
-                    continue
-                denom2 = max(1e-6, 1.0 - p[i] - p[j])
-                p3_k += p[i] * (p[j] / denom1) * (p[k] / denom2)
-        place_prob[k] = quinella_prob[k] + p3_k
-
-    return np.clip(quinella_prob, 0.0, 0.999), np.clip(place_prob, 0.0, 0.999)
-
-
-def generate_ev_tickets(
-    pred_df: pd.DataFrame,
-    pair_odds_df: pd.DataFrame | None,
-    exacta_odds_df: pd.DataFrame | None,
-    trio_odds_df: pd.DataFrame | None,
-    strategy: str,
-    budget_yen: int,
-    min_ev: float,
-) -> pd.DataFrame:
-    """ハービル確率と実オッズ（未取得時は合成オッズ）から全券種の期待値計算・資金配分を行う"""
-    df = pred_df.sort_values("horse_num").reset_index(drop=True)
-    n = len(df)
-    if n == 0:
-        return pd.DataFrame()
-
-    nums = df["horse_num"].astype(int).tolist()
-    names = dict(zip(nums, df["horse_name"].astype(str)))
-    win_odds_map = dict(zip(nums, df["win_odds"].astype(float)))
-    p_map = dict(zip(nums, df["ai_win_prob"].astype(float)))
-    pop_rank_map = dict(zip(nums, df["popularity"].astype(int)))
-
-    excluded_axis = set()
-    if "穴狙い" in strategy:
-        excluded_axis = {h for h, r in pop_rank_map.items() if r in (1, 2)}
-
-    umaren_real = {}
-    wide_real = {}
-    if pair_odds_df is not None and not pair_odds_df.empty:
-        for _, r in pair_odds_df.iterrows():
-            k = (int(min(r["horse_num_1"], r["horse_num_2"])), int(max(r["horse_num_1"], r["horse_num_2"])))
-            if "umaren_odds" in r and pd.notna(r["umaren_odds"]):
-                umaren_real[k] = float(r["umaren_odds"])
-            if "wide_odds" in r and pd.notna(r["wide_odds"]):
-                wide_real[k] = float(r["wide_odds"])
-
-    exacta_real = {}
-    if exacta_odds_df is not None and not exacta_odds_df.empty:
-        for _, r in exacta_odds_df.iterrows():
-            k = (int(r["horse_num_1"]), int(r["horse_num_2"]))
-            if "exacta_odds" in r and pd.notna(r["exacta_odds"]):
-                exacta_real[k] = float(r["exacta_odds"])
-
-    trio_real = {}
-    if trio_odds_df is not None and not trio_odds_df.empty:
-        for _, r in trio_odds_df.iterrows():
-            k = tuple(sorted([int(r["horse_num_1"]), int(r["horse_num_2"]), int(r["horse_num_3"])]))
-            if "trio_odds" in r and pd.notna(r["trio_odds"]):
-                trio_real[k] = float(r["trio_odds"])
-
-    raw_mkt = np.array([1.0 / max(1.05, win_odds_map[h]) for h in nums], dtype=float)
-    q_mkt = dict(zip(nums, raw_mkt / raw_mkt.sum()))
-
-    candidates = []
-
-    # 1. 単勝
-    for h in nums:
-        if h in excluded_axis:
-            continue
-        prob = p_map[h]
-        odds = win_odds_map[h]
-        candidates.append({
-            "bet_type": "単勝",
-            "combo": f"{h:02d}",
-            "horses": names[h],
-            "prob": prob,
-            "odds": odds,
-            "ev": prob * odds,
-            "is_real_odds": True,
-        })
-
-    top_horses = df.sort_values("ai_win_prob", ascending=False)["horse_num"].astype(int).head(8).tolist()
-
-    # 2. 馬連・ワイド・馬単
-    for h1, h2 in itertools.combinations(sorted(top_horses), 2):
-        p1, p2 = p_map[h1], p_map[h2]
-        p_12 = p1 * (p2 / max(1e-6, 1.0 - p1))
-        p_21 = p2 * (p1 / max(1e-6, 1.0 - p2))
-        prob_umaren = p_12 + p_21
-
-        if (h1, h2) in umaren_real:
-            o_umaren = umaren_real[(h1, h2)]
-            real_u = True
-        else:
-            qm1, qm2 = q_mkt[h1], q_mkt[h2]
-            qm_u = qm1 * (qm2 / max(1e-6, 1.0 - qm1)) + qm2 * (qm1 / max(1e-6, 1.0 - qm2))
-            o_umaren = round(float(np.clip(0.775 / max(1e-5, qm_u), 1.5, 999.9)), 1)
-            real_u = False
-
-        if not ("穴狙い" in strategy and (h1 in excluded_axis or h2 in excluded_axis)):
-            candidates.append({
-                "bet_type": "馬連",
-                "combo": f"{h1:02d}-{h2:02d}",
-                "horses": f"{names[h1]} - {names[h2]}",
-                "prob": prob_umaren,
-                "odds": o_umaren,
-                "ev": prob_umaren * o_umaren,
-                "is_real_odds": real_u,
-            })
-
-        prob_wide = prob_umaren
-        for h3 in nums:
-            if h3 == h1 or h3 == h2:
-                continue
-            p3 = p_map[h3]
-            d1 = max(1e-6, 1.0 - p3)
-            prob_wide += p3 * (p1 / d1) * (p2 / max(1e-6, d1 - p1))
-            prob_wide += p3 * (p2 / d1) * (p1 / max(1e-6, d1 - p2))
-            d_1 = max(1e-6, 1.0 - p1)
-            prob_wide += p1 * (p3 / d_1) * (p2 / max(1e-6, d_1 - p3))
-            d_2 = max(1e-6, 1.0 - p2)
-            prob_wide += p2 * (p3 / d_2) * (p1 / max(1e-6, d_2 - p3))
-
-        if (h1, h2) in wide_real:
-            o_wide = wide_real[(h1, h2)]
-            real_w = True
-        else:
-            o_wide = round(float(np.clip(o_umaren * 0.36, 1.1, 250.0)), 1)
-            real_w = False
-
-        if not ("穴狙い" in strategy and (h1 in excluded_axis or h2 in excluded_axis)):
-            candidates.append({
-                "bet_type": "ワイド",
-                "combo": f"{h1:02d}-{h2:02d}",
-                "horses": f"{names[h1]} - {names[h2]}",
-                "prob": prob_wide,
-                "odds": o_wide,
-                "ev": prob_wide * o_wide,
-                "is_real_odds": real_w,
-            })
-
-        for first_h, second_h, p_ex in ((h1, h2, p_12), (h2, h1, p_21)):
-            if first_h in excluded_axis:
-                continue
-            if (first_h, second_h) in exacta_real:
-                o_ex = exacta_real[(first_h, second_h)]
-                real_e = True
-            else:
-                qm1, qm2 = q_mkt[first_h], q_mkt[second_h]
-                qm_e = qm1 * (qm2 / max(1e-6, 1.0 - qm1))
-                o_ex = round(float(np.clip(0.75 / max(1e-5, qm_e), 2.0, 1999.9)), 1)
-                real_e = False
-
-            candidates.append({
-                "bet_type": "馬単",
-                "combo": f"{first_h:02d}->{second_h:02d}",
-                "horses": f"{names[first_h]} -> {names[second_h]}",
-                "prob": p_ex,
-                "odds": o_ex,
-                "ev": p_ex * o_ex,
-                "is_real_odds": real_e,
-            })
-
-    # 3. 三連複
-    top_trio_horses = sorted(top_horses[:7])
-    for h1, h2, h3 in itertools.combinations(top_trio_horses, 3):
-        if "穴狙い" in strategy and (h1 in excluded_axis or h2 in excluded_axis or h3 in excluded_axis):
-            continue
-        prob_trio = 0.0
-        for a, b, c in itertools.permutations((h1, h2, h3)):
-            pa, pb, pc = p_map[a], p_map[b], p_map[c]
-            d1 = max(1e-6, 1.0 - pa)
-            d2 = max(1e-6, 1.0 - pa - pb)
-            prob_trio += pa * (pb / d1) * (pc / d2)
-
-        key3 = (h1, h2, h3)
-        if key3 in trio_real:
-            o_trio = trio_real[key3]
-            real_t = True
-        else:
-            qm_trio = 0.0
-            for a, b, c in itertools.permutations((h1, h2, h3)):
-                qa, qb, qc = q_mkt[a], q_mkt[b], q_mkt[c]
-                qm_trio += qa * (qb / max(1e-6, 1.0 - qa)) * (qc / max(1e-6, 1.0 - qa - qb))
-            o_trio = round(float(np.clip(0.75 / max(1e-6, qm_trio), 3.0, 4999.9)), 1)
-            real_t = False
-
-        candidates.append({
-            "bet_type": "三連複",
-            "combo": f"{h1:02d}-{h2:02d}-{h3:02d}",
-            "horses": f"{names[h1]} - {names[h2]} - {names[h3]}",
-            "prob": prob_trio,
-            "odds": o_trio,
-            "ev": prob_trio * o_trio,
-            "is_real_odds": real_t,
-        })
-
-    if not candidates:
-        return pd.DataFrame()
-
-    cand_df = pd.DataFrame(candidates)
-
-    if "堅実" in strategy:
-        cand_df["rank_score"] = cand_df["ev"] * np.sqrt(np.clip(cand_df["prob"], 0.005, 1.0))
-    else:
-        cand_df["rank_score"] = cand_df["ev"] * (np.clip(cand_df["prob"], 0.005, 1.0) ** 0.25)
-
-    cand_df = cand_df.sort_values("rank_score", ascending=False).reset_index(drop=True)
-
-    n_units = max(1, budget_yen // 100)
-    if budget_yen <= 300:
-        max_tickets = min(3, n_units)
-    elif budget_yen <= 500:
-        max_tickets = min(5, n_units)
-    else:
-        max_tickets = min(10, n_units)
-
-    picked = cand_df[cand_df["ev"] >= min_ev].head(max_tickets).copy()
-    if picked.empty:
-        picked = cand_df.head(min(3, max_tickets)).copy()
-
-    k_cnt = len(picked)
-    stakes = np.full(k_cnt, 100, dtype=int)
-    rem_units = n_units - k_cnt
-    if rem_units > 0:
-        weights = np.maximum(picked["ev"].to_numpy(dtype=float) - 0.8, 0.1)
-        weights = weights / weights.sum()
-        extra = np.floor(weights * rem_units).astype(int)
-        stakes += extra * 100
-        leftover = n_units - int(stakes.sum() // 100)
-        for idx_l in range(leftover):
-            stakes[idx_l % k_cnt] += 100
-
-    picked["stake"] = stakes
-    picked["expected_return"] = (picked["stake"] * picked["odds"]).round(0).astype(int)
-    return picked
-
-
-# ---------------------------------------------------------
-# データ読み込み・状態初期化
-# ---------------------------------------------------------
-def _load_initial_upcoming() -> dict:
-    if os.path.exists(UPCOMING_CSV):
-        try:
-            df = pd.read_csv(UPCOMING_CSV, dtype={"race_id": str})
-            if not df.empty:
-                return {
-                    "shutuba_df": df,
-                    "pair_odds_df": None,
-                    "exacta_odds_df": None,
-                    "trio_odds_df": None,
-                    "has_real_win": True,
-                    "has_real_multi": False,
-                }
-        except Exception:
-            pass
-
-    sample_rows = []
-    for i in range(1, 13):
-        sample_rows.append({
-            "race_id": "202605050811",
-            "date": datetime.now(JST).strftime("%Y-%m-%d"),
-            "venue": "東京",
-            "race_title": "サンプルレース（左メニューから開催日取得を実行してください）",
-            "start_time": "15:40",
-            "surface": "芝",
-            "distance": 2000,
-            "track_condition": "良",
-            "frame_num": min(8, (i - 1) // 2 + 1),
-            "horse_num": i,
-            "horse_name": f"テストホース{i:02d}",
-            "weight_carried": 57.0,
-            "horse_weight": 480,
-            "weight_diff": 0,
-            "jockey_id": "UNKNOWN_J",
-            "trainer_id": "UNKNOWN_T",
-            "prev1_rank": (i % 7) + 1,
-            "prev2_rank": ((i + 2) % 8) + 1,
-            "prev3_rank": ((i + 4) % 9) + 1,
-            "prev1_time_diff": round(0.1 * i, 2),
-            "win_odds": round(2.5 * i, 1),
-        })
-    return {
-        "shutuba_df": pd.DataFrame(sample_rows),
-        "pair_odds_df": None,
-        "exacta_odds_df": None,
-        "trio_odds_df": None,
-        "has_real_win": False,
-        "has_real_multi": False,
-    }
-
-
-if "race_list" not in st.session_state:
-    st.session_state["race_list"] = []
-if "current_bundle" not in st.session_state:
-    st.session_state["current_bundle"] = _load_initial_upcoming()
-if "selected_venue" not in st.session_state:
-    init_df = st.session_state["current_bundle"]["shutuba_df"]
-    st.session_state["selected_venue"] = str(init_df["venue"].iloc[0]) if "venue" in init_df.columns else "東京"
-if "selected_race_num" not in st.session_state:
-    init_df = st.session_state["current_bundle"]["shutuba_df"]
-    rid_0 = str(init_df["race_id"].iloc[0]) if "race_id" in init_df.columns else "202605050811"
-    st.session_state["selected_race_num"] = int(rid_0[10:12]) if len(rid_0) >= 12 and rid_0[10:12].isdigit() else 11
-
-
-def _select_and_fetch_race(race_id: str, date_str: str):
-    if shutuba_scraper is None:
-        st.error("06_shutuba_scraper.py が見つかりません。")
-        return
-    try:
-        with st.spinner("出馬表と全券種オッズを取得中..."):
-            bundle = shutuba_scraper.fetch_shutuba_and_odds(race_id, date_str)
-            st.session_state["current_bundle"] = bundle
-            os.makedirs(os.path.dirname(UPCOMING_CSV), exist_ok=True)
-            bundle["shutuba_df"].to_csv(UPCOMING_CSV, index=False, encoding="utf-8-sig")
-    except Exception as exc:
-        st.error(f"レースデータの取得に失敗しました: {exc}")
-
-
-# ---------------------------------------------------------
-# サイドバー（開催日・データ取得・戦略設定）
-# ---------------------------------------------------------
-with st.sidebar:
-    st.markdown("### 開催日・データ取得")
-    default_dt = datetime.now(JST).date()
-    target_date = st.date_input("開催日を選択", value=default_dt)
+uploaded_file = None
+if data_source == "WebからJRA出馬表・オッズを自動取得":
+    target_date = st.sidebar.date_input("開催日を選択", value=date.today())
     target_date_str = target_date.strftime("%Y-%m-%d")
 
-    if st.button("開催レース一覧を取得", use_container_width=True, type="primary"):
-        if shutuba_scraper is None:
-            st.error("06_shutuba_scraper.py が見つかりません。")
-        else:
+    if st.sidebar.button("開催レース一覧を取得", width="stretch"):
+        with st.spinner("開催レース一覧を取得中..."):
             try:
-                with st.spinner(f"{target_date_str} の開催レース一覧を取得中..."):
-                    r_list = shutuba_scraper.fetch_race_list_by_date(target_date_str)
-                if not r_list:
-                    st.warning("指定日のJRA開催レースが見つかりませんでした。土日祝の日付を選択してください。")
+                races_found = shutuba_scraper.fetch_race_list_by_date(target_date_str)
+                st.session_state["fetched_race_list"] = races_found
+                st.session_state["fetched_race_date"] = target_date_str
+                if not races_found:
+                    st.sidebar.warning("指定日のJRA開催レースが見つかりませんでした。土日祝の日付を指定してください。")
                 else:
-                    st.session_state["race_list"] = r_list
-                    venues_avail = list(dict.fromkeys([r["venue"] for r in r_list]))
+                    # 取得直後に最初の開催場のメインレース(11R)または先頭レースを自動表示
+                    venues_avail = list(dict.fromkeys(r["venue"] for r in races_found))
                     first_v = venues_avail[0]
-                    v_races = [r for r in r_list if r["venue"] == first_v]
-                    default_r = next((r for r in v_races if r["race_num"] == 11), v_races[-1])
-                    st.session_state["selected_venue"] = first_v
-                    st.session_state["selected_race_num"] = default_r["race_num"]
-                    _select_and_fetch_race(default_r["race_id"], target_date_str)
+                    v_races = [r for r in races_found if r["venue"] == first_v]
+                    default_r = next((r for r in v_races if r["race_num"] == 11), v_races[0])
+                    load_race_into_session(default_r, target_date_str)
+                    st.rerun()
             except Exception as e:
-                st.error(f"一覧取得エラー: {e}")
+                st.sidebar.error(f"一覧取得エラー: {e}")
 
-    race_list = st.session_state["race_list"]
+    race_list = st.session_state.get("fetched_race_list", [])
     if race_list:
-        cur_v = st.session_state["selected_venue"]
-        cur_rn = st.session_state["selected_race_num"]
-        cur_item = next(
-            (r for r in race_list if r["venue"] == cur_v and r["race_num"] == cur_rn),
-            race_list[0],
-        )
-        labels = [r["label"] for r in race_list]
-        cur_idx = labels.index(cur_item["label"])
-        chosen_label = st.selectbox("開催レース直接選択", labels, index=cur_idx)
-        chosen_obj = next(r for r in race_list if r["label"] == chosen_label)
-        if chosen_obj["venue"] != cur_v or chosen_obj["race_num"] != cur_rn:
-            st.session_state["selected_venue"] = chosen_obj["venue"]
-            st.session_state["selected_race_num"] = chosen_obj["race_num"]
-            _select_and_fetch_race(chosen_obj["race_id"], target_date_str)
-            st.rerun()
+        label_to_item = {item["label"]: item for item in race_list}
+        current_rid = st.session_state.get("selected_race_id")
+        labels_list = list(label_to_item.keys())
+        default_idx = 0
+        for idx_l, item in enumerate(race_list):
+            if item["race_id"] == current_rid:
+                default_idx = idx_l
+                break
 
-    st.markdown("---")
-    st.markdown("### 予想方針・予算設定")
-    strategy_choice = st.radio(
-        "予想方針",
-        ["標準バランス", "穴狙い（1・2番人気軸除外）", "堅実重視"],
-        index=0,
-    )
-    budget_label = st.radio(
-        "1レース予算モード",
-        ["300円モード", "500円モード", "2000円モード"],
-        index=1,
-        horizontal=True,
-    )
-    budget_yen = int(re.sub(r"\D", "", budget_label))
-
-    ai_weight_pct = st.slider("AI独自度 (%)", min_value=20, max_value=100, value=75, step=5)
-    min_ev_th = st.slider("推奨最低期待値 (EV)", min_value=0.80, max_value=2.00, value=1.05, step=0.05)
-
-
-# ---------------------------------------------------------
-# 上部ヘッダーバー
-# ---------------------------------------------------------
-status_cls = "badge-green" if train_status["is_real"] else "badge-warn"
-short_strategy = "穴狙い(上位人気除外)" if "穴狙い" in strategy_choice else strategy_choice
-
-st.markdown(
-    f"""
-<div class="top-navbar">
-    <div class="top-navbar-title">JRA KEIBA AI</div>
-    <div class="nav-badges">
-        <span class="{status_cls}">{train_status["badge"]}</span>
-        <span class="badge-slate">方針: {short_strategy}</span>
-        <span class="badge-slate">AI独自度: {ai_weight_pct}%</span>
-    </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-
-# ---------------------------------------------------------
-# 写真準拠 2段ナビゲーション（開催馬場ボタン & 1R-12Rボタン）
-# ---------------------------------------------------------
-race_list = st.session_state["race_list"]
-if race_list:
-    venues = list(dict.fromkeys([r["venue"] for r in race_list]))
-    if st.session_state["selected_venue"] not in venues:
-        st.session_state["selected_venue"] = venues[0]
-    active_venue = st.session_state["selected_venue"]
-
-    v_cols = st.columns([1] * len(venues) + [2, 1.3])
-    for idx_v, v_name in enumerate(venues):
-        is_active_v = v_name == active_venue
-        if v_cols[idx_v].button(
-            v_name,
-            key=f"venue_btn_{v_name}",
-            type="primary" if is_active_v else "secondary",
-            use_container_width=True,
-        ):
-            st.session_state["selected_venue"] = v_name
-            v_races = [r for r in race_list if r["venue"] == v_name]
-            target_r = next(
-                (r for r in v_races if r["race_num"] == st.session_state["selected_race_num"]),
-                v_races[0],
-            )
-            st.session_state["selected_race_num"] = target_r["race_num"]
-            _select_and_fetch_race(target_r["race_id"], target_date_str)
-            st.rerun()
-
-    venue_races = [r for r in race_list if r["venue"] == active_venue]
-    avail_rnums = {r["race_num"]: r for r in venue_races}
-    if st.session_state["selected_race_num"] not in avail_rnums:
-        st.session_state["selected_race_num"] = venue_races[0]["race_num"]
-    active_rnum = st.session_state["selected_race_num"]
-
-    if v_cols[-1].button("最新更新", key="refresh_odds_btn", use_container_width=True):
-        cur_r_obj = avail_rnums[active_rnum]
-        _select_and_fetch_race(cur_r_obj["race_id"], target_date_str)
-        st.rerun()
-
-    r_cols = st.columns([1.3] + [1] * 12 + [1.3])
-    sorted_rnums = sorted(avail_rnums.keys())
-    pos_in_list = sorted_rnums.index(active_rnum)
-
-    if r_cols[0].button("← 前R", key="prev_race_btn", disabled=(pos_in_list == 0), use_container_width=True):
-        prev_rn = sorted_rnums[pos_in_list - 1]
-        st.session_state["selected_race_num"] = prev_rn
-        _select_and_fetch_race(avail_rnums[prev_rn]["race_id"], target_date_str)
-        st.rerun()
-
-    for r_idx in range(1, 13):
-        exists_r = r_idx in avail_rnums
-        is_sel_r = r_idx == active_rnum
-        if r_cols[r_idx].button(
-            f"{r_idx}R",
-            key=f"rnum_btn_{r_idx}",
-            type="primary" if is_sel_r else "secondary",
-            disabled=not exists_r,
-            use_container_width=True,
-        ):
-            st.session_state["selected_race_num"] = r_idx
-            _select_and_fetch_race(avail_rnums[r_idx]["race_id"], target_date_str)
-            st.rerun()
-
-    if r_cols[13].button(
-        "次R →",
-        key="next_race_btn",
-        disabled=(pos_in_list >= len(sorted_rnums) - 1),
-        use_container_width=True,
-    ):
-        next_rn = sorted_rnums[pos_in_list + 1]
-        st.session_state["selected_race_num"] = next_rn
-        _select_and_fetch_race(avail_rnums[next_rn]["race_id"], target_date_str)
-        st.rerun()
-
-
-# ---------------------------------------------------------
-# 推論・勝率ブレンド・期待値計算
-# ---------------------------------------------------------
-bundle = st.session_state["current_bundle"]
-shutuba_df = bundle["shutuba_df"].copy()
-
-if train_mod is not None and hasattr(train_mod, "create_features"):
-    feat_df, _ = train_mod.create_features(shutuba_df, category_maps=category_maps)
+        selected_label = st.sidebar.selectbox("対象レース（または上のボタンで選択）", labels_list, index=default_idx)
+        if st.sidebar.button("選択レースの出馬表とオッズを取得", type="primary", width="stretch"):
+            sel_item = label_to_item[selected_label]
+            with st.spinner(f"{sel_item['venue']} {sel_item['race_num']}R を取得中..."):
+                try:
+                    load_race_into_session(
+                        sel_item,
+                        st.session_state.get("fetched_race_date", target_date_str),
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"取得エラー: {e}")
 else:
-    feat_df, _ = _fallback_create_features(shutuba_df, category_maps)
+    uploaded_file = st.sidebar.file_uploader("出馬表CSV（任意）", type=["csv"])
 
-raw_ai_probs = model.predict_proba(feat_df[feature_cols])[:, 1]
-raw_ai_probs = np.clip(raw_ai_probs, 1e-5, 1.0)
-pure_ai_prob = raw_ai_probs / raw_ai_probs.sum()
+st.sidebar.header("2. 狙い方・バランス調整")
+style_label = st.sidebar.radio(
+    "狙い方スタイル",
+    [
+        "標準バランス（実力軸＋妙味中穴）",
+        "堅実重視（的中率優先）",
+        "穴狙い特化（高配当EV優先）",
+    ],
+    index=0,
+)
+style_map = {
+    "標準バランス（実力軸＋妙味中穴）": "balanced",
+    "堅実重視（的中率優先）": "solid",
+    "穴狙い特化（高配当EV優先）": "upset",
+}
+selected_style_mode = style_map[style_label]
 
-win_odds_arr = pd.to_numeric(shutuba_df["win_odds"], errors="coerce").fillna(20.0).to_numpy(dtype=float)
-win_odds_arr = np.clip(win_odds_arr, 1.05, 999.9)
-mkt_raw = 1.0 / win_odds_arr
+ai_weight = st.sidebar.slider(
+    "AI独自度（低いほど実オッズの実力評価を加味）",
+    min_value=0.40,
+    max_value=1.00,
+    value=0.75,
+    step=0.05,
+)
+exclude_fav1 = st.sidebar.checkbox("単勝1番人気を軸・BOXから除外", value=False)
+ev_threshold = st.sidebar.slider("期待値（EV）下限", min_value=0.80, max_value=2.50, value=1.15, step=0.05)
+
+with st.sidebar.expander("詳細フィルタ・手動オッズCSV"):
+    pair_odds_file = st.file_uploader("馬連・ワイド実オッズCSV", type=["csv"])
+    trio_odds_file = st.file_uploader("三連複実オッズCSV", type=["csv"])
+    min_win_prob = st.slider("単勝 最低予測勝率（%）", min_value=0.0, max_value=20.0, value=3.0, step=0.5)
+    min_pair_prob = st.slider("馬連・ワイド 最低的中率（%）", min_value=0.0, max_value=15.0, value=1.5, step=0.5)
+    min_trio_prob = st.slider("三連複 最低的中率（%）", min_value=0.0, max_value=5.0, value=0.4, step=0.1)
+    max_tickets = st.slider("詳細タブ 最大買い目点数", min_value=3, max_value=25, value=10, step=1)
+    budget = st.number_input("詳細タブ 自由予算（円）", min_value=1000, max_value=100000, value=10000, step=1000)
+
+# 対象出馬表の決定
+if uploaded_file is not None:
+    race_df = pd.read_csv(uploaded_file)
+elif "active_race_df" in st.session_state:
+    race_df = st.session_state["active_race_df"].copy()
+else:
+    race_df = pd.read_csv("data/upcoming_race.csv")
+
+pair_odds_df = pd.read_csv(pair_odds_file) if pair_odds_file is not None else st.session_state.get("auto_pair_odds_df")
+exacta_odds_df = st.session_state.get("auto_exacta_odds_df")
+trio_odds_df = pd.read_csv(trio_odds_file) if trio_odds_file is not None else st.session_state.get("auto_trio_odds_df")
+
+# 1. 単勝予測確率の算出
+feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
+raw_probs = model.predict_proba(feat_df[feature_cols])[:, 1]
+ai_pure_prob = raw_probs / raw_probs.sum()
+
+mkt_raw = 0.80 / np.clip(race_df["win_odds"].to_numpy(dtype=float), 1.1, 500.0)
 mkt_prob = mkt_raw / mkt_raw.sum()
 
-alpha = ai_weight_pct / 100.0
-blended_prob = alpha * pure_ai_prob + (1.0 - alpha) * mkt_prob
-blended_prob = blended_prob / blended_prob.sum()
+blended_prob = (ai_weight * ai_pure_prob) + ((1.0 - ai_weight) * mkt_prob)
+race_df["win_prob"] = blended_prob / blended_prob.sum()
 
-quinella_prob, place_prob = compute_harville_probabilities(blended_prob)
+# 2. ハービル公式による全券種確率＆期待値の算出
+race_df = calculate_horse_place_probs(race_df, prob_col="win_prob")
+pairs_df = calculate_pair_probabilities(race_df, prob_col="win_prob", pair_odds_df=pair_odds_df)
+exacta_df = calculate_exacta_probabilities(race_df, prob_col="win_prob", exacta_odds_df=exacta_odds_df)
+trio_df = calculate_trio_probabilities(race_df, prob_col="win_prob", trio_odds_df=trio_odds_df)
 
-shutuba_df["win_odds"] = win_odds_arr
-shutuba_df["popularity"] = shutuba_df["win_odds"].rank(method="min").astype(int)
-shutuba_df["pure_ai_prob"] = pure_ai_prob
-shutuba_df["ai_win_prob"] = blended_prob
-shutuba_df["quinella_prob"] = quinella_prob
-shutuba_df["place_prob"] = place_prob
-shutuba_df["win_ev"] = shutuba_df["ai_win_prob"] * shutuba_df["win_odds"]
-
-shutuba_df["eval_score"] = shutuba_df["ai_win_prob"] * (np.clip(shutuba_df["win_ev"], 0.6, 2.5) ** 0.35)
-rank_order = shutuba_df["eval_score"].rank(ascending=False, method="first").astype(int)
-marks = []
-for r_ord in rank_order:
-    if r_ord == 1:
-        marks.append("◎")
-    elif r_ord == 2:
-        marks.append("○")
-    elif r_ord == 3:
-        marks.append("▲")
-    elif r_ord in (4, 5):
-        marks.append("△")
-    elif r_ord == 6:
-        marks.append("☆")
-    else:
-        marks.append("")
-shutuba_df["mark"] = marks
-
-tickets_df = generate_ev_tickets(
-    pred_df=shutuba_df,
-    pair_odds_df=bundle.get("pair_odds_df"),
-    exacta_odds_df=bundle.get("exacta_odds_df"),
-    trio_odds_df=bundle.get("trio_odds_df"),
-    strategy=strategy_choice,
-    budget_yen=budget_yen,
-    min_ev=min_ev_th,
+budget_modes = build_budget_mode_tickets(
+    horses_df=race_df,
+    pairs_df=pairs_df,
+    exacta_df=exacta_df,
+    trio_df=trio_df,
+    exclude_fav1=exclude_fav1,
+    style_mode=selected_style_mode,
 )
 
+trio_strategies = build_trio_strategies(
+    trio_df=trio_df,
+    horses_df=race_df,
+    ev_threshold=ev_threshold,
+    min_prob_pct=min_trio_prob,
+    max_single_tickets=max_tickets,
+    max_followers=min(max_tickets, 8),
+    exclude_fav1=exclude_fav1,
+)
 
-# ---------------------------------------------------------
-# レース情報バナー表示
-# ---------------------------------------------------------
-first_row = shutuba_df.iloc[0]
-rid_str = str(first_row.get("race_id", "202605050811"))
-venue_disp = str(first_row.get("venue", "東京"))
-rnum_disp = int(rid_str[10:12]) if len(rid_str) >= 12 and rid_str[10:12].isdigit() else 11
-start_time_disp = str(first_row.get("start_time", "") or "")
-time_badge_html = f'<span class="race-banner-time">{start_time_disp} 発走</span>' if start_time_disp else ""
+# 人気順・期待値・偏差値風能力スコアの付与
+race_df["popularity"] = race_df["win_odds"].rank(method="min", ascending=True).astype(int)
+race_df["単勝期待値(EV)"] = (race_df["pred_win_pct"] / 100.0) * race_df["win_odds"]
 
-raw_rtitle = str(first_row.get("race_title", "") or "").strip()
-if not raw_rtitle or raw_rtitle == "nan":
-    raw_rtitle = f"{venue_disp} {rnum_disp}R"
+p_mean = race_df["pred_win_pct"].mean()
+p_std = max(race_df["pred_win_pct"].std(), 1e-6)
+race_df["ability_score"] = np.clip(50.0 + ((race_df["pred_win_pct"] - p_mean) / p_std) * 8.5, 35.0, 78.0).round(1)
 
-surface_raw = str(first_row.get("surface", "芝"))
-surface_short = "ダ" if "ダ" in surface_raw else "芝"
-dist_disp = int(float(first_row.get("distance", 2000)))
-cond_disp = str(first_row.get("track_condition", "良"))
-n_horses = len(shutuba_df)
+race_df = race_df.sort_values("pred_win_pct", ascending=False).reset_index(drop=True)
+race_df["ai_rank"] = np.arange(1, len(race_df) + 1)
 
-if bundle.get("has_real_multi"):
-    odds_status_txt = "全券種実オッズ取得済"
-elif bundle.get("has_real_win"):
-    odds_status_txt = "単勝実オッズ取得済"
-else:
-    odds_status_txt = "AI期待値算出済"
+marks = ["◎", "○", "▲", "△", "☆"]
+race_df["印"] = [marks[i] if i < len(marks) else "--" for i in range(len(race_df))]
 
-max_ev_val = float(tickets_df["ev"].max()) if not tickets_df.empty else float(shutuba_df["win_ev"].max())
-strong_cnt = int((shutuba_df["win_ev"] >= 1.0).sum())
 
-st.markdown(
-    f"""
-<div class="race-banner">
-    <div>
-        <div class="race-banner-sub">{venue_disp} {rnum_disp}R {time_badge_html}</div>
-        <div class="race-banner-title">{raw_rtitle}</div>
-        <div class="race-banner-meta">
-            <span>{surface_short} {dist_disp}m</span>
-            <span>{n_horses}頭</span>
-            <span class="cond-pill">{surface_short}:{cond_disp}</span>
-            <span class="status-pill">{odds_status_txt}</span>
-        </div>
-    </div>
-    <div class="gauge-group">
-        <div class="ring-box ring-orange">
-            <div class="ring-val-orange">{max_ev_val:.2f}</div>
-            <div class="ring-label">最高EV</div>
-        </div>
-        <div class="ring-box ring-green">
-            <div class="ring-val-green">{strong_cnt}</div>
-            <div class="ring-label">有力候補</div>
-        </div>
-    </div>
+def get_signal_and_conf(row) -> tuple[str, str]:
+    rank = int(row["ai_rank"])
+    ev = float(row["単勝期待値(EV)"])
+    win_p = float(row["pred_win_pct"])
+
+    if rank == 1 and not (exclude_fav1 and int(row["popularity"]) == 1):
+        sig = '<span class="sig-axis">軸</span>'
+    elif ev >= ev_threshold and win_p >= 4.0:
+        sig = '<span class="sig-value">穴注目</span>'
+    elif rank <= 6 or float(row["pred_place_pct"]) >= 25.0:
+        sig = '<span class="sig-himo">紐候補</span>'
+    else:
+        sig = '<span class="sig-wait">様子見</span>'
+
+    if rank == 1 and win_p >= 22.0:
+        conf = '<span class="conf-s">S</span>'
+    elif rank == 1 or (rank == 2 and win_p >= 14.0):
+        conf = '<span class="conf-a">A</span>'
+    elif rank <= 3 and win_p >= 9.0:
+        conf = '<span class="conf-b">B</span>'
+    else:
+        conf = '<span class="conf-none">-</span>'
+    return sig, conf
+
+
+sigs, confs = [], []
+for _, r in race_df.iterrows():
+    s_html, c_html = get_signal_and_conf(r)
+    sigs.append(s_html)
+    confs.append(c_html)
+race_df["signal_html"] = sigs
+race_df["conf_html"] = confs
+
+# ==============================================================================
+# トップナビゲーションバー
+# ==============================================================================
+data_pill_cls = "nav-pill-real" if train_status["is_real"] else "nav-pill-warn"
+style_short_badge = style_label.split("（")[0]
+navbar_html = f"""
+<div class="top-navbar">
+  <div class="brand">JRA KEIBA AI</div>
+  <div class="nav-badges">
+    <span class="{data_pill_cls}">{html.escape(train_status['badge'])}</span>
+    <span class="nav-pill">方針: {html.escape(style_short_badge)}</span>
+    <span class="nav-pill">AI独自度: {int(ai_weight * 100)}%</span>
+  </div>
 </div>
-""",
-    unsafe_allow_html=True,
-)
+"""
+st.markdown(navbar_html.strip(), unsafe_allow_html=True)
 
+tab_main, tab_stats, tab_help = st.tabs([
+    "レース予想・買い目",
+    "戦績・回収率",
+    "ヘルプ・算出ロジック解説",
+])
 
-# ---------------------------------------------------------
-# 推奨買い目（ハービル期待値ベース）
-# ---------------------------------------------------------
-st.markdown(
-    f'<div class="section-heading">AI推奨買い目（{budget_yen:,}円モード / {short_strategy}）</div>',
-    unsafe_allow_html=True,
-)
+# ==============================================================================
+# タブ1：メインの予想・買い目画面
+# ==============================================================================
+with tab_main:
+    r_info = race_df.iloc[0]
+    race_id_str = str(r_info.get("race_id", "202605050811"))
+    race_num_int = int(race_id_str[-2:]) if len(race_id_str) >= 2 and race_id_str[-2:].isdigit() else 11
+    race_num_label = f"{race_num_int}R"
+    current_venue = str(r_info["venue"])
+    current_date_str = st.session_state.get("fetched_race_date", str(r_info["date"]))
 
-bet_filter = st.radio(
-    "券種表示フィルタ",
-    ["すべて", "単勝", "馬連", "ワイド", "馬単", "三連複"],
-    index=0,
-    horizontal=True,
-)
+    # ==========================================================================
+    # 写真準拠：開催馬場選択ボタンバー ＋ レース移動ボタンバー
+    # ==========================================================================
+    fetched_list = st.session_state.get("fetched_race_list", [])
+    if fetched_list:
+        venues_in_day = list(dict.fromkeys(item["venue"] for item in fetched_list))
+        active_venue = st.session_state.get("selected_venue", current_venue)
+        if active_venue not in venues_in_day:
+            active_venue = venues_in_day[0]
 
-if tickets_df.empty:
-    st.info("条件に合致する推奨買い目が見つかりませんでした。最低期待値（EV）のしきい値を下げて確認してください。")
-else:
-    view_tickets = tickets_df if bet_filter == "すべて" else tickets_df[tickets_df["bet_type"] == bet_filter]
-    if view_tickets.empty:
-        st.info(f"選択中の券種（{bet_filter}）では期待値基準を満たす買い目がありません。「すべて」で全券種を確認できます。")
-    else:
-        disp_t = pd.DataFrame({
-            "券種": view_tickets["bet_type"],
-            "買い目": view_tickets["combo"],
-            "対象馬": view_tickets["horses"],
-            "AI的中率": view_tickets["prob"].map(lambda x: f"{x * 100:.1f}%"),
-            "オッズ": view_tickets["odds"].map(lambda x: f"{x:.1f}倍"),
-            "期待値(EV)": view_tickets["ev"].map(lambda x: f"{x:.2f}"),
-            "購入金額": view_tickets["stake"].map(lambda x: f"{int(x):,}円"),
-            "想定払戻": view_tickets["expected_return"].map(lambda x: f"{int(x):,}円"),
-        })
-        st.dataframe(disp_t, use_container_width=True, hide_index=True)
+        # 1段目：開催馬場ボタン（例：福島 | 京都 | 東京） ＋ 最新更新ボタン
+        st.markdown('<div class="venue-nav-zone"></div>', unsafe_allow_html=True)
+        v_cols = st.columns(len(venues_in_day) + 1)
+        for idx_v, v_name in enumerate(venues_in_day):
+            with v_cols[idx_v]:
+                is_active_v = (v_name == active_venue)
+                if st.button(
+                    v_name,
+                    key=f"btn_venue_{v_name}",
+                    type="primary" if is_active_v else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state["selected_venue"] = v_name
+                    v_races = [r for r in fetched_list if r["venue"] == v_name]
+                    # 同じR番号があれば維持、なければ11Rまたは先頭レースへ切替
+                    target_r = next(
+                        (r for r in v_races if r["race_num"] == race_num_int),
+                        next((r for r in v_races if r["race_num"] == 11), v_races[0]),
+                    )
+                    with st.spinner(f"{v_name} {target_r['race_num']}R を読み込み中..."):
+                        try:
+                            load_race_into_session(target_r, current_date_str)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"取得エラー: {e}")
 
-        total_stake = int(view_tickets["stake"].sum())
-        max_ret = int(view_tickets["expected_return"].max())
-        st.caption(f"表示合計投資額: {total_stake:,}円 / 最大想定払戻: {max_ret:,}円")
+        with v_cols[-1]:
+            if st.button("最新更新", key="btn_refresh_odds", type="secondary", width="stretch"):
+                cur_item = next((r for r in fetched_list if r["race_id"] == race_id_str), None)
+                if cur_item:
+                    with st.spinner("最新オッズを再取得中..."):
+                        try:
+                            load_race_into_session(cur_item, current_date_str)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"更新エラー: {e}")
 
-    memo_lines = [f"[{venue_disp}{rnum_disp}R {raw_rtitle}] 合計 {int(tickets_df['stake'].sum()):,}円"]
-    for _, tr in tickets_df.iterrows():
-        memo_lines.append(
-            f"{tr['bet_type']} {tr['combo']} ({tr['horses']}) : {int(tr['stake'])}円 [EV {tr['ev']:.2f} / {tr['odds']:.1f}倍]"
+        # 2段目：← 前R | 1R〜12R クイック切替 | 次R →
+        venue_races = sorted(
+            [r for r in fetched_list if r["venue"] == active_venue],
+            key=lambda x: x["race_num"],
         )
-    memo_text = "\n".join(memo_lines)
+        if venue_races:
+            cur_idx_in_v = next(
+                (i for i, r in enumerate(venue_races) if r["race_id"] == race_id_str),
+                0,
+            )
+            st.markdown('<div class="race-nav-zone"></div>', unsafe_allow_html=True)
+            nav_cols = st.columns([1.4] + [1.0] * len(venue_races) + [1.4])
 
-    col_memo, col_save = st.columns([2.2, 1])
-    with col_memo:
-        with st.expander("スマホ投票用メモ（コピー用テキスト）"):
-            st.code(memo_text, language="text")
+            with nav_cols[0]:
+                prev_disabled = (cur_idx_in_v <= 0)
+                if st.button("← 前R", key="btn_prev_race", disabled=prev_disabled, width="stretch"):
+                    target_r = venue_races[cur_idx_in_v - 1]
+                    with st.spinner(f"{active_venue} {target_r['race_num']}R を取得中..."):
+                        try:
+                            load_race_into_session(target_r, current_date_str)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"取得エラー: {e}")
 
-    with col_save:
-        if st.button("この買い目を戦績履歴に保存", use_container_width=True):
-            os.makedirs(os.path.dirname(BETS_CSV), exist_ok=True)
-            save_rows = tickets_df.copy()
-            save_rows["saved_at"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
-            save_rows["race_id"] = rid_str
-            save_rows["venue"] = venue_disp
-            save_rows["race_num"] = rnum_disp
-            save_rows["race_title"] = raw_rtitle
-            save_rows["hit"] = 0
-            save_rows["payout"] = 0
-            if os.path.exists(BETS_CSV):
-                old_b = pd.read_csv(BETS_CSV)
-                all_b = pd.concat([old_b, save_rows], ignore_index=True)
-            else:
-                all_b = save_rows
-            all_b.to_csv(BETS_CSV, index=False, encoding="utf-8-sig")
-            st.success("買い目を data/bet_history.csv に保存しました。")
+            for idx_r, r_item in enumerate(venue_races):
+                with nav_cols[idx_r + 1]:
+                    is_cur_r = (r_item["race_id"] == race_id_str)
+                    if st.button(
+                        f"{r_item['race_num']}R",
+                        key=f"btn_rnum_{r_item['race_id']}",
+                        type="primary" if is_cur_r else "secondary",
+                        width="stretch",
+                    ):
+                        if not is_cur_r:
+                            with st.spinner(f"{active_venue} {r_item['race_num']}R を取得中..."):
+                                try:
+                                    load_race_into_session(r_item, current_date_str)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"取得エラー: {e}")
 
-
-# ---------------------------------------------------------
-# 出走馬 AI評価・予測勝率一覧
-# ---------------------------------------------------------
-st.markdown('<div class="section-heading">出走馬 AI予測スコア・単勝期待値一覧</div>', unsafe_allow_html=True)
-
-sort_mode = st.radio(
-    "並び順",
-    ["馬番順", "AI勝率順", "単勝期待値(EV)順"],
-    index=0,
-    horizontal=True,
-)
-if sort_mode == "AI勝率順":
-    table_src = shutuba_df.sort_values("ai_win_prob", ascending=False)
-elif sort_mode == "単勝期待値(EV)順":
-    table_src = shutuba_df.sort_values("win_ev", ascending=False)
-else:
-    table_src = shutuba_df.sort_values("horse_num", ascending=True)
-
-disp_horses = pd.DataFrame({
-    "印": table_src["mark"],
-    "枠": table_src["frame_num"].astype(int),
-    "馬番": table_src["horse_num"].astype(int),
-    "馬名": table_src["horse_name"],
-    "騎手": table_src["jockey_id"],
-    "斤量": table_src["weight_carried"].map(lambda x: f"{float(x):.1f}"),
-    "単勝オッズ": table_src["win_odds"].map(lambda x: f"{float(x):.1f}"),
-    "人気": table_src["popularity"].astype(int),
-    "AI勝率": table_src["ai_win_prob"].map(lambda x: f"{float(x) * 100:.1f}%"),
-    "連対率": table_src["quinella_prob"].map(lambda x: f"{float(x) * 100:.1f}%"),
-    "複勝率": table_src["place_prob"].map(lambda x: f"{float(x) * 100:.1f}%"),
-    "単勝EV": table_src["win_ev"].map(lambda x: f"{float(x):.2f}"),
-})
-
-st.dataframe(disp_horses, use_container_width=True, hide_index=True)
-
-
-# ---------------------------------------------------------
-# 戦績・回収率トラッカー
-# ---------------------------------------------------------
-with st.expander("戦績・回収率トラッカー（保存済み買い目履歴）"):
-    if os.path.exists(BETS_CSV):
-        try:
-            hist_bets = pd.read_csv(BETS_CSV)
-            if not hist_bets.empty:
-                tot_cost = int(pd.to_numeric(hist_bets["stake"], errors="coerce").fillna(0).sum())
-                tot_pay = int(pd.to_numeric(hist_bets["payout"], errors="coerce").fillna(0).sum())
-                tot_hits = int((pd.to_numeric(hist_bets["hit"], errors="coerce").fillna(0) > 0).sum())
-                roi_pct = (tot_pay / tot_cost * 100.0) if tot_cost > 0 else 0.0
-                hit_pct = (tot_hits / len(hist_bets) * 100.0) if len(hist_bets) > 0 else 0.0
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("総購入点数", f"{len(hist_bets):,}点")
-                m2.metric("的中率", f"{hit_pct:.1f}% ({tot_hits}的中)")
-                m3.metric("総投資 / 総払戻", f"{tot_cost:,}円 / {tot_pay:,}円")
-                m4.metric("回収率 (ROI)", f"{roi_pct:.1f}%")
-
-                edited_bets = st.data_editor(
-                    hist_bets,
-                    use_container_width=True,
-                    hide_index=True,
-                    key="bet_history_editor",
-                )
-                if st.button("払戻・的中結果を保存", key="save_edited_bets"):
-                    edited_bets.to_csv(BETS_CSV, index=False, encoding="utf-8-sig")
-                    st.success("戦績データを更新しました。")
-            else:
-                st.caption("保存された買い目履歴はまだありません。")
-        except Exception as exc:
-            st.warning(f"履歴ファイルの読み込みエラー: {exc}")
+            with nav_cols[-1]:
+                next_disabled = (cur_idx_in_v >= len(venue_races) - 1)
+                if st.button("次R →", key="btn_next_race", disabled=next_disabled, width="stretch"):
+                    target_r = venue_races[cur_idx_in_v + 1]
+                    with st.spinner(f"{active_venue} {target_r['race_num']}R を取得中..."):
+                        try:
+                            load_race_into_session(target_r, current_date_str)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"取得エラー: {e}")
     else:
-        st.caption("保存された買い目履歴はまだありません。「この買い目を戦績履歴に保存」ボタンで記録できます。")
+        # まだ開催一覧を取得していない場合でもワンタップで当日レース一覧を呼べるボタンを表示
+        st.markdown('<div class="venue-nav-zone"></div>', unsafe_allow_html=True)
+        q_c1, q_c2 = st.columns([2, 3])
+        with q_c1:
+            if st.button("本日の開催馬場一覧を読み込む", type="primary", width="stretch"):
+                today_s = date.today().strftime("%Y-%m-%d")
+                with st.spinner("開催馬場一覧を取得中..."):
+                    try:
+                        races_found = shutuba_scraper.fetch_race_list_by_date(today_s)
+                        st.session_state["fetched_race_list"] = races_found
+                        st.session_state["fetched_race_date"] = today_s
+                        if races_found:
+                            venues_avail = list(dict.fromkeys(r["venue"] for r in races_found))
+                            v_races = [r for r in races_found if r["venue"] == venues_avail[0]]
+                            default_r = next((r for r in v_races if r["race_num"] == 11), v_races[0])
+                            load_race_into_session(default_r, today_s)
+                            st.rerun()
+                        else:
+                            st.info("本日はJRA開催がありません。左サイドバーから土日祝の日付を選択してください。")
+                    except Exception as e:
+                        st.error(f"取得エラー: {e}")
+        with q_c2:
+            st.caption("※ 過去日や週末のレースを選ぶ場合は、左上の「>」からサイドバーを開いて開催日を選択してください。")
+
+    # ==========================================================================
+    # レース情報バナー
+    # ==========================================================================
+    surface_short = "ダ" if "ダ" in str(r_info["surface"]) else "芝"
+    race_title_display = (
+        str(r_info["race_title"])
+        if "race_title" in race_df.columns and pd.notna(r_info["race_title"]) and str(r_info["race_title"]).strip() != ""
+        else f"{r_info['venue']} {surface_short}{int(r_info['distance'])}m"
+    )
+    start_time_display = (
+        f"{r_info['start_time']} 発走"
+        if "start_time" in race_df.columns and pd.notna(r_info["start_time"]) and str(r_info["start_time"]).strip() != ""
+        else f"{r_info['date']} 開催"
+    )
+    odds_badge_text = st.session_state.get("odds_status_label", "AI期待値算出済")
+
+    race_meta = {
+        "race_id": race_id_str,
+        "date": str(r_info["date"]),
+        "venue": str(r_info["venue"]),
+        "race_num": race_num_int,
+        "race_title": race_title_display,
+    }
+
+    max_ev_val = float(race_df["単勝期待値(EV)"].max())
+    active_candidates = int((race_df["ai_rank"] <= 6).sum())
+
+    banner_html = f"""
+    <div class="race-banner">
+      <div>
+        <div class="race-title-row">
+          <span class="race-venue-r">{html.escape(str(r_info['venue']))} {race_num_label}</span>
+          <span class="race-time">{html.escape(start_time_display)}</span>
+        </div>
+        <div class="race-name-main">{html.escape(race_title_display)}</div>
+        <div class="race-meta-row">
+          <span>{surface_short} {int(r_info['distance'])}m</span>
+          <span>{len(race_df)}頭</span>
+          <span class="cond-badge">{surface_short}:{html.escape(str(r_info['track_condition']))}</span>
+          <span class="status-badge">{html.escape(odds_badge_text)}</span>
+        </div>
+      </div>
+      <div class="ring-group">
+        <div class="ring-circle ring-orange">
+          <span class="ring-num-orange">{max_ev_val:.2f}</span>
+          <span class="ring-label">最高EV</span>
+        </div>
+        <div class="ring-circle ring-green">
+          <span class="ring-num-green">{active_candidates}</span>
+          <span class="ring-label">有力候補</span>
+        </div>
+      </div>
+    </div>
+    """
+    st.markdown(banner_html.strip(), unsafe_allow_html=True)
+
+    def render_horse_chips(nums: list[int], df_horses: pd.DataFrame, is_axis: bool = False) -> str:
+        num_to_name = dict(zip(df_horses["horse_num"].astype(int), df_horses["horse_name"]))
+        cls = "horse-chip horse-chip-axis" if is_axis else "horse-chip"
+        chips = [
+            f'<span class="{cls}">{n:02d} {html.escape(str(num_to_name.get(n, "")))}</span>'
+            for n in nums
+        ]
+        return "".join(chips)
+
+    # ==========================================================================
+    # 買い目モード選択パネル
+    # ==========================================================================
+    st.markdown("### 買い目モード選択")
+
+    if "selected_budget_mode" not in st.session_state:
+        st.session_state["selected_budget_mode"] = "500"
+
+    current_mode = st.session_state["selected_budget_mode"]
+
+    st.markdown('<div class="mode-btn-zone"></div>', unsafe_allow_html=True)
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    with btn_col1:
+        if st.button(
+            "300円",
+            key="btn_mode_300",
+            type="primary" if current_mode == "300" else "secondary",
+            width="stretch",
+        ):
+            st.session_state["selected_budget_mode"] = "300"
+            st.rerun()
+
+    with btn_col2:
+        if st.button(
+            "500円",
+            key="btn_mode_500",
+            type="primary" if current_mode == "500" else "secondary",
+            width="stretch",
+        ):
+            st.session_state["selected_budget_mode"] = "500"
+            st.rerun()
+
+    with btn_col3:
+        if st.button(
+            "2000円",
+            key="btn_mode_2000",
+            type="primary" if current_mode == "2000" else "secondary",
+            width="stretch",
+        ):
+            st.session_state["selected_budget_mode"] = "2000"
+            st.rerun()
+
+    current_mode = st.session_state["selected_budget_mode"]
+
+    if current_mode == "500":
+        m500 = budget_modes["mode_500"]
+        df_500 = m500["tickets_df"]
+        card_500 = f"""
+    <div class="bet-card">
+      <div class="bet-card-title">500円モード：3連複 2頭軸5頭流し（計 {len(df_500)}点 × 100円 ＝ {m500['total_cost']}円）</div>
+      <div style="margin-bottom:6px;"><strong>軸2頭：</strong> {render_horse_chips(m500['axis'], race_df, is_axis=True)}</div>
+      <div><strong>相手5頭：</strong> {render_horse_chips(m500['followers'], race_df, is_axis=False)}</div>
+    </div>
+    """
+        st.markdown(card_500.strip(), unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("合計購入金額", f"{m500['total_cost']} 円（{len(df_500)}点）")
+        c2.metric("合成的中率", f"{df_500['三連複的中率(%)'].sum():.2f}%")
+        c3.metric("想定払戻レンジ", f"{df_500['想定払戻(円)'].min():,} 〜 {df_500['想定払戻(円)'].max():,} 円")
+        st.dataframe(
+            df_500[["券種", "組み合わせ", "馬名トリオ", "三連複オッズ", "三連複的中率(%)", "三連複期待値(EV)", "購入額(円)", "想定払戻(円)"]]
+            .style.format({"三連複オッズ": "{:.1f}", "三連複的中率(%)": "{:.2f}%", "三連複期待値(EV)": "{:.2f}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+    elif current_mode == "300":
+        m300 = budget_modes["mode_300"]
+        df_300 = m300["tickets_df"]
+        card_300 = f"""
+    <div class="bet-card">
+      <div class="bet-card-title">300円モード：期待値(EV)と的中率バランス厳選3点（計 {len(df_300)}点 × 100円 ＝ {m300['total_cost']}円）</div>
+      <div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{html.escape(style_short_badge)}）に基づき、全券種から現実的かつ妙味のある3点を抽出しています。</div>
+    </div>
+    """
+        st.markdown(card_300.strip(), unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("合計購入金額", f"{m300['total_cost']} 円（{len(df_300)}点）")
+        c2.metric("平均期待値(EV)", f"{df_300['期待値(EV)'].mean():.2f}")
+        c3.metric("最大想定払戻", f"{df_300['想定払戻(円)'].max():,} 円")
+        st.dataframe(
+            df_300[["券種", "組み合わせ", "対象馬名", "オッズ", "的中率(%)", "期待値(EV)", "購入額(円)", "想定払戻(円)"]]
+            .style.format({"オッズ": "{:.1f}", "的中率(%)": "{:.2f}%", "期待値(EV)": "{:.2f}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+    else:
+        m2000 = budget_modes["mode_2000"]
+        df_trio_2000 = m2000["trio_df"]
+        df_exacta_2000 = m2000["exacta_df"]
+        df_wide_2000 = m2000["wide_df"]
+        card_2000 = f"""
+    <div class="bet-card">
+      <div class="bet-card-title">2000円モード：3券種フルパッケージ（計 20点 × 100円 ＝ {m2000['total_cost']:,}円）</div>
+      <div style="margin-bottom:5px;"><strong>1. 3連複 2頭軸5頭流し（500円）：</strong> 軸 {render_horse_chips(m2000['trio_axis'], race_df, is_axis=True)} ／ 相手 {render_horse_chips(m2000['trio_followers'], race_df)}</div>
+      <div style="margin-bottom:5px;"><strong>2. 馬単 4頭ボックス（1200円）：</strong> {render_horse_chips(m2000['exacta_box'], race_df)}</div>
+      <div><strong>3. ワイド 3頭ボックス（300円）：</strong> {render_horse_chips(m2000['wide_box'], race_df)}</div>
+    </div>
+    """
+        st.markdown(card_2000.strip(), unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("合計投資額", f"{m2000['total_cost']:,} 円（20点）")
+        c2.metric("3連複 5点合成的中率", f"{df_trio_2000['三連複的中率(%)'].sum():.2f}%")
+        c3.metric("馬単 12点合成的中率", f"{df_exacta_2000['馬単的中率(%)'].sum():.2f}%")
+        c4.metric("ワイド 3点延べ的中率", f"{df_wide_2000['ワイド的中率(%)'].sum():.2f}%")
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.markdown("#### 1. 3連複 2頭軸5頭流し（5点・500円）")
+            st.dataframe(
+                df_trio_2000[["組み合わせ", "馬名トリオ", "三連複オッズ", "三連複的中率(%)", "三連複期待値(EV)", "想定払戻(円)"]]
+                .style.format({"三連複オッズ": "{:.1f}", "三連複的中率(%)": "{:.2f}%", "三連複期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+            st.markdown("#### 3. ワイド 3頭ボックス（3点・300円）")
+            st.dataframe(
+                df_wide_2000[["組み合わせ", "馬名ペア", "ワイドオッズ", "ワイド的中率(%)", "ワイド期待値(EV)", "想定払戻(円)"]]
+                .style.format({"ワイドオッズ": "{:.1f}", "ワイド的中率(%)": "{:.2f}%", "ワイド期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+        with col_right:
+            st.markdown("#### 2. 馬単 4頭ボックス（12点・1200円）")
+            st.dataframe(
+                df_exacta_2000[["組み合わせ", "馬名順列", "馬単オッズ", "馬単的中率(%)", "馬単期待値(EV)", "想定払戻(円)"]]
+                .style.format({"馬単オッズ": "{:.1f}", "馬単的中率(%)": "{:.2f}%", "馬単期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+
+    # ==========================================================================
+    # 買い目保存 ＆ 即PAT連携アクションバー
+    # ==========================================================================
+    active_ticket_rows = bet_tracker.extract_mode_ticket_rows(current_mode, budget_modes)
+    ipat_data = bet_tracker.build_ipat_exports(race_meta, current_mode, budget_modes, active_ticket_rows)
+
+    act_c1, act_c2, act_c3 = st.columns(3)
+    with act_c1:
+        if st.button(f"この{current_mode}円モード買い目を履歴に保存", type="primary", width="stretch"):
+            saved_n, skipped_n = bet_tracker.append_bets_to_history(race_meta, active_ticket_rows)
+            if saved_n > 0:
+                st.success(f"{saved_n}点の買い目を保存しました。「戦績・回収率」タブから結果照合できます。")
+            else:
+                st.info(f"このレースの{current_mode}円モード買い目はすでに保存済みです（重複スキップ: {skipped_n}点）。")
+    with act_c2:
+        st.download_button(
+            label="IPAT連携用CSVをダウンロード",
+            data=ipat_data["ipat_csv"].encode("utf-8-sig"),
+            file_name=ipat_data["filename"],
+            mime="text/csv",
+            width="stretch",
+        )
+    with act_c3:
+        st.link_button(
+            label="JRA 即PAT を開く",
+            url="https://www.ipat.jra.go.jp/",
+            width="stretch",
+        )
+
+    with st.expander("即PAT入力用テキスト・IPAT連携データを確認（右上のアイコンでコピー可能）"):
+        st.caption("即PAT画面に入力しやすいまとめ表記です。右上のコピーボタンからメモやスマホへ貼り付けできます。")
+        st.code(ipat_data["human_text"], language="text")
+        st.caption("ipatgo 等のIPAT連動ツール向けCSVフォーマット:")
+        st.code(ipat_data["ipat_csv"].strip(), language="text")
+
+    # ==========================================================================
+    # 出走表テーブル
+    # ==========================================================================
+    st.markdown(f"### 出走表 <span style='font-size:0.88rem; color:#64748b; font-weight:600;'>{len(race_df)}頭</span>", unsafe_allow_html=True)
+
+    table_rows_html = []
+    for _, r in race_df.iterrows():
+        ai_rank = int(r["ai_rank"])
+        row_cls = "row-rank-1" if ai_rank == 1 else ("row-rank-2" if ai_rank == 2 else ("row-rank-3" if ai_rank == 3 else ""))
+        waku = int(np.clip(r["frame_num"], 1, 8))
+        umaban = int(r["horse_num"])
+        umaban_cls = "umaban-txt umaban-top" if ai_rank <= 2 else "umaban-txt"
+
+        ability = float(r["ability_score"])
+        bar_pct = int(np.clip((ability - 35.0) / (75.0 - 35.0) * 100.0, 8, 100))
+        if ability >= 56.0:
+            bar_color = "#dc2626"
+        elif ability >= 50.0:
+            bar_color = "#f97316"
+        else:
+            bar_color = "#2563eb"
+
+        prob_cls = "prob-hot" if ai_rank == 1 else ("prob-warm" if ai_rank == 2 else "prob-norm")
+        ev_val = float(r["単勝期待値(EV)"])
+        ev_style = "color:#dc2626; font-weight:800;" if ev_val >= ev_threshold else "color:#475569; font-weight:600;"
+
+        row_str = (
+            f'<tr class="{row_cls}">'
+            f'<td><div class="pop-tag">{int(r["popularity"])}人気</div><div class="odds-val">{float(r["win_odds"]):.1f}</div></td>'
+            f'<td style="font-weight:800;">{ai_rank}</td>'
+            f'<td><span class="waku-badge waku-{waku}">{waku}</span></td>'
+            f'<td><span class="{umaban_cls}">{umaban}</span></td>'
+            f'<td><span class="mark-badge">{html.escape(str(r["印"]))}</span></td>'
+            f'<td class="horse-cell"><div class="horse-title">{html.escape(str(r["horse_name"]))}</div>'
+            f'<div class="jockey-sub">{html.escape(str(r["jockey_id"]))} &nbsp; {float(r["weight_carried"]):.1f}</div></td>'
+            f'<td>{r["signal_html"]}</td>'
+            f'<td>{r["conf_html"]}</td>'
+            f'<td><div class="ability-wrap"><span class="ability-num">{ability:.1f}</span>'
+            f'<div class="bar-bg"><div class="bar-fill" style="width:{bar_pct}%; background:{bar_color};"></div></div></div></td>'
+            f'<td class="{prob_cls}">{float(r["pred_win_pct"]):.1f}%</td>'
+            f'<td class="{prob_cls}">{float(r["pred_quinella_pct"]):.1f}%</td>'
+            f'<td class="{prob_cls}">{float(r["pred_place_pct"]):.1f}%</td>'
+            f'<td style="{ev_style}">{ev_val:.2f}</td>'
+            f'</tr>'
+        )
+        table_rows_html.append(row_str)
+
+    shutuba_html = (
+        '<div class="shutuba-wrapper"><table class="shutuba-table">'
+        '<thead><tr>'
+        '<th>単勝オッズ ▼</th><th>AI順位 ▼</th><th>枠</th><th>馬番</th><th>印</th>'
+        '<th style="text-align:left; padding-left:12px;">馬名 / 騎手 ▼</th>'
+        '<th>シグナル</th><th>信頼度</th><th>能力値 ▼</th>'
+        '<th>勝率 ▼</th><th>2着内率 ▼</th><th>3着内率 ▼</th><th>単勝EV ▼</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(table_rows_html)}</tbody>'
+        '</table></div>'
+    )
+    st.markdown(shutuba_html, unsafe_allow_html=True)
+
+    # ==========================================================================
+    # 券種別 詳細データ一覧タブ
+    # ==========================================================================
+    def allocate_budget(df_target: pd.DataFrame, ev_col: str, odds_col: str, total_budget: int) -> pd.DataFrame:
+        res = df_target.copy()
+        n_rows = len(res)
+        if n_rows == 0:
+            return res
+        weights = res[ev_col] / res[ev_col].sum()
+        raw_alloc = (total_budget * weights) // 100 * 100
+        if total_budget >= n_rows * 100:
+            raw_alloc = raw_alloc.clip(lower=100)
+        res["推奨購入額(円)"] = raw_alloc.astype(int)
+        res["想定払戻(円)"] = (res["推奨購入額(円)"] * res[odds_col]).astype(int)
+        return res
+
+    def format_horse_list(nums: list[int], df_horses: pd.DataFrame) -> str:
+        num_to_name = dict(zip(df_horses["horse_num"].astype(int), df_horses["horse_name"]))
+        return " , ".join([f"{n:02d}({num_to_name.get(n, '')})" for n in nums])
+
+    st.markdown("### 券種別 詳細データ一覧")
+    tab_win, tab_umaren, tab_wide, tab_trio = st.tabs([
+        "単勝 一覧",
+        "馬連 一覧",
+        "ワイド 一覧",
+        "三連複 フォーメーション・単品",
+    ])
+
+    rename_map = {
+        "horse_num": "馬番",
+        "horse_name": "馬名",
+        "win_odds": "単勝オッズ",
+        "pred_win_pct": "予測勝率(%)",
+    }
+
+    with tab_win:
+        win_buy = race_df[(race_df["単勝期待値(EV)"] >= ev_threshold) & (race_df["pred_win_pct"] >= min_win_prob)].copy()
+        if len(win_buy) > 0:
+            win_buy = allocate_budget(win_buy, "単勝期待値(EV)", "win_odds", budget)
+            st.dataframe(
+                win_buy[["印", "horse_num", "horse_name", "win_odds", "pred_win_pct", "単勝期待値(EV)", "推奨購入額(円)", "想定払戻(円)"]]
+                .rename(columns=rename_map)
+                .style.format({"単勝オッズ": "{:.1f}", "予測勝率(%)": "{:.1f}%", "単勝期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("条件を満たす単勝買い目がありません。")
+
+    with tab_umaren:
+        umaren_buy = (
+            pairs_df[(pairs_df["馬連期待値(EV)"] >= ev_threshold) & (pairs_df["馬連的中率(%)"] >= min_pair_prob)]
+            .sort_values("馬連期待値(EV)", ascending=False)
+            .head(max_tickets)
+        )
+        if len(umaren_buy) > 0:
+            umaren_buy = allocate_budget(umaren_buy, "馬連期待値(EV)", "馬連オッズ", budget)
+            st.dataframe(
+                umaren_buy[["組み合わせ", "馬名ペア", "馬連オッズ", "馬連的中率(%)", "馬連期待値(EV)", "推奨購入額(円)", "想定払戻(円)"]]
+                .style.format({"馬連オッズ": "{:.1f}", "馬連的中率(%)": "{:.2f}%", "馬連期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("条件を満たす馬連買い目がありません。")
+
+    with tab_wide:
+        wide_buy = (
+            pairs_df[(pairs_df["ワイド期待値(EV)"] >= ev_threshold) & (pairs_df["ワイド的中率(%)"] >= min_pair_prob)]
+            .sort_values("ワイド期待値(EV)", ascending=False)
+            .head(max_tickets)
+        )
+        if len(wide_buy) > 0:
+            wide_buy = allocate_budget(wide_buy, "ワイド期待値(EV)", "ワイドオッズ", budget)
+            st.dataframe(
+                wide_buy[["組み合わせ", "馬名ペア", "ワイドオッズ", "ワイド的中率(%)", "ワイド期待値(EV)", "推奨購入額(円)", "想定払戻(円)"]]
+                .style.format({"ワイドオッズ": "{:.1f}", "ワイド的中率(%)": "{:.2f}%", "ワイド期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("条件を満たすワイド買い目がありません。")
+
+    with tab_trio:
+        form = trio_strategies["formation"]
+        form_df = form["tickets_df"]
+        if len(form_df) > 0:
+            form_df = allocate_budget(form_df, "三連複期待値(EV)", "三連複オッズ", budget)
+            st.markdown(
+                f"**自動フォーメーション（全 {len(form_df)} 点）** — "
+                f"1列目: `{format_horse_list(form['col1'], race_df)}` ／ "
+                f"2列目: `{format_horse_list(form['col2'], race_df)}` ／ "
+                f"3列目: `{format_horse_list(form['col3'], race_df)}`"
+            )
+            st.dataframe(
+                form_df[["組み合わせ", "馬名トリオ", "三連複オッズ", "三連複的中率(%)", "三連複期待値(EV)", "推奨購入額(円)", "想定払戻(円)"]]
+                .style.format({"三連複オッズ": "{:.1f}", "三連複的中率(%)": "{:.2f}%", "三連複期待値(EV)": "{:.2f}"}),
+                width="stretch",
+                hide_index=True,
+            )
+        else:
+            st.info("フォーメーションを構築できる候補が不足しています。")
+
+# ==============================================================================
+# タブ2：戦績・回収率ダッシュボード
+# ==============================================================================
+with tab_stats:
+    st.markdown("### 予想買い目の戦績・回収率管理")
+
+    hist_df = bet_tracker.load_bet_history()
+
+    top_a1, top_a2 = st.columns([2, 1])
+    with top_a1:
+        if st.button("未確定レースの結果をWebから自動照合して回収率を更新", type="primary", width="stretch"):
+            with st.spinner("確定結果と公式払戻金を照合中..."):
+                summary = bet_tracker.settle_pending_bets()
+                if summary["settled_tickets"] > 0:
+                    st.success(
+                        f"照合完了: {summary['checked_races']}レース / {summary['settled_tickets']}点を判定しました（うち的中: {summary['hit_tickets']}点）。"
+                    )
+                    st.rerun()
+                else:
+                    st.info("新しく確定できた未照合レースはありませんでした（発走前、またはすべて照合済みです）。")
+    with top_a2:
+        if not hist_df.empty:
+            st.download_button(
+                label="戦績履歴CSVをダウンロード",
+                data=hist_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="jra_ai_bet_history.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+    if hist_df.empty:
+        st.info(
+            "保存されている買い目がまだありません。「レース予想・買い目」タブで300円 / 500円 / 2000円モードを選び、「この買い目を履歴に保存」を押すとここに蓄積されます。"
+        )
+    else:
+        settled_df = hist_df[hist_df["status"].isin(["的中", "不的中"])].copy()
+        pending_count = int((hist_df["status"] == "未確定").sum())
+
+        total_bet_settled = int(settled_df["amount"].sum()) if not settled_df.empty else 0
+        total_payout = int(settled_df["payout"].sum()) if not settled_df.empty else 0
+        net_profit = total_payout - total_bet_settled
+        roi_pct = (total_payout / total_bet_settled * 100.0) if total_bet_settled > 0 else 0.0
+
+        if not settled_df.empty:
+            race_grp = settled_df.groupby(["race_id", "mode"]).agg(
+                投資額=("amount", "sum"),
+                払戻額=("payout", "sum"),
+                的中点数=("status", lambda s: int((s == "的中").sum())),
+            )
+            race_hit_rate = (race_grp["的中点数"] > 0).mean() * 100.0
+            hit_races = int((race_grp["的中点数"] > 0).sum())
+            total_races = len(race_grp)
+        else:
+            race_hit_rate = 0.0
+            hit_races = 0
+            total_races = 0
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("確定済み総投資額", f"{total_bet_settled:,} 円", f"未確定: {pending_count}点")
+        k2.metric("総払戻額", f"{total_payout:,} 円")
+        k3.metric("トータル収支", f"{net_profit:+,} 円")
+        k4.metric("総合回収率", f"{roi_pct:.1f}%")
+        k5.metric("レース的中率", f"{race_hit_rate:.1f}%", f"{hit_races} / {total_races} 戦")
+
+        if not settled_df.empty:
+            def summarize_by_col(df_in: pd.DataFrame, group_col: str, label_name: str) -> pd.DataFrame:
+                g = df_in.groupby(group_col, as_index=False).agg(
+                    購入点数=("amount", "count"),
+                    的中数=("status", lambda s: int((s == "的中").sum())),
+                    投資額=("amount", "sum"),
+                    払戻額=("payout", "sum"),
+                )
+                g["収支"] = g["払戻額"] - g["投資額"]
+                g["的中率(%)"] = (g["的中数"] / g["購入点数"]) * 100.0
+                g["回収率(%)"] = (g["払戻額"] / g["投資額"]) * 100.0
+                return g.rename(columns={group_col: label_name})
+
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.markdown("#### モード別 回収率（300円 / 500円 / 2000円）")
+                mode_summary = summarize_by_col(settled_df, "mode", "モード")
+                st.dataframe(
+                    mode_summary.style.format({
+                        "投資額": "{:,}",
+                        "払戻額": "{:,}",
+                        "収支": "{:+,}",
+                        "的中率(%)": "{:.1f}%",
+                        "回収率(%)": "{:.1f}%",
+                    }),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with col_s2:
+                st.markdown("#### 券種別 回収率")
+                type_summary = summarize_by_col(settled_df, "ticket_type", "券種")
+                st.dataframe(
+                    type_summary.style.format({
+                        "投資額": "{:,}",
+                        "払戻額": "{:,}",
+                        "収支": "{:+,}",
+                        "的中率(%)": "{:.1f}%",
+                        "回収率(%)": "{:.1f}%",
+                    }),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        st.markdown("#### レース別 戦績一覧")
+        race_summary = (
+            hist_df.groupby(["date", "venue", "race_num", "race_title", "race_id", "mode"], as_index=False)
+            .agg(
+                点数=("amount", "count"),
+                投資額=("amount", "sum"),
+                払戻額=("payout", "sum"),
+                状態=("status", lambda s: "未確定" if (s == "未確定").any() else ("的中" if (s == "的中").any() else "不的中")),
+                確定結果=("actual_result", "first"),
+            )
+            .sort_values(["date", "race_id"], ascending=[False, False])
+        )
+        race_summary["収支"] = race_summary.apply(
+            lambda r: 0 if r["状態"] == "未確定" else int(r["払戻額"] - r["投資額"]),
+            axis=1,
+        )
+        race_summary["回収率(%)"] = race_summary.apply(
+            lambda r: 0.0 if r["状態"] == "未確定" or r["投資額"] == 0 else (r["払戻額"] / r["投資額"]) * 100.0,
+            axis=1,
+        )
+        st.dataframe(
+            race_summary[["date", "venue", "race_num", "race_title", "mode", "点数", "投資額", "払戻額", "収支", "回収率(%)", "状態", "確定結果"]]
+            .rename(columns={"date": "開催日", "venue": "場", "race_num": "R", "race_title": "レース名", "mode": "モード"})
+            .style.format({"投資額": "{:,}", "払戻額": "{:,}", "収支": "{:+,}", "回収率(%)": "{:.1f}%"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.markdown("#### 買い目明細ログ")
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            filter_status = st.multiselect("ステータスで絞り込み", ["未確定", "的中", "不的中"], default=["未確定", "的中", "不的中"])
+        with f_col2:
+            filter_mode = st.multiselect("モードで絞り込み", ["300円", "500円", "2000円"], default=["300円", "500円", "2000円"])
+
+        view_df = hist_df[hist_df["status"].isin(filter_status) & hist_df["mode"].isin(filter_mode)].copy()
+        view_df["combination"] = view_df["combination"].str.replace(">", "→", regex=False)
+        st.dataframe(
+            view_df[["date", "venue", "race_num", "mode", "ticket_type", "combination", "horse_names", "amount", "pred_odds", "status", "payout", "actual_result"]]
+            .rename(columns={
+                "date": "開催日",
+                "venue": "場",
+                "race_num": "R",
+                "mode": "モード",
+                "ticket_type": "券種",
+                "combination": "組み合わせ",
+                "horse_names": "対象馬名",
+                "amount": "投資(円)",
+                "pred_odds": "予想時オッズ",
+                "status": "判定",
+                "payout": "払戻(円)",
+                "actual_result": "確定上位",
+            })
+            .style.format({"予想時オッズ": "{:.1f}", "投資(円)": "{:,}", "払戻(円)": "{:,}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+        with st.expander("履歴の削除・リセット"):
+            del_options = [
+                f"{r['date']} {r['venue']}{r['race_num']}R ({r['mode']}) | {r['race_id']}"
+                for _, r in race_summary.iterrows()
+            ]
+            if del_options:
+                sel_del = st.selectbox("削除するレース履歴を選択", del_options)
+                if st.button("選択したレースの履歴を削除"):
+                    target_rid = sel_del.split("|")[-1].strip()
+                    target_mode = sel_del.split("(")[-1].split(")")[0].strip()
+                    bet_tracker.delete_race_from_history(target_rid, target_mode)
+                    st.success("削除しました。")
+                    st.rerun()
+
+            st.divider()
+            confirm_clear = st.checkbox("すべての戦績履歴を完全に削除する（元に戻せません）")
+            if st.button("全履歴をリセット", disabled=not confirm_clear):
+                bet_tracker.clear_all_history()
+                st.success("全履歴をリセットしました。")
+                st.rerun()
+
+# ==============================================================================
+# タブ3：ヘルプ・算出ロジック解説画面
+# ==============================================================================
+with tab_help:
+    help_html_1 = f"""
+<div class="help-card">
+  <h4>1. 現在のAIモデルと学習データの状態</h4>
+  <p style="margin-bottom:8px;"><strong>ステータス：</strong> {html.escape(train_status['badge'])}</p>
+  <p style="color:#475569; margin-bottom:10px;">{html.escape(train_status['detail'])}</p>
+  <div class="formula-box">
+    JRA実データ5年分を収集して再学習するコマンド手順:<br>
+    1. python 05_scrape_history.py --start-date 2022-01-01 --end-date 2026-11-24 --min-race-num 1<br>
+    2. python 02_train_model.py
+  </div>
+</div>
+
+<div class="help-card">
+  <h4>2. 開催馬場ボタン・レース切替ボタンの使い方</h4>
+  <table class="help-table">
+    <thead>
+      <tr><th>ボタン・表示</th><th>動作内容</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>開催馬場ボタン（東京・京都 等）</strong></td><td>開催日のレース一覧を取得すると、当日の開催場が丸角ボタンで並びます。タップするだけで別会場の同R（またはメインR）へ即座に切り替わります。</td></tr>
+      <tr><td><strong>← 前R / 1R〜12R / 次R →</strong></td><td>選択中の競馬場の前後のレースや指定R番号へワンタップで移動し、出馬表と全オッズを自動取得します。</td></tr>
+      <tr><td><strong>最新更新</strong></td><td>発走直前のオッズ変動を取り込むため、現在表示しているレースのオッズを再取得します。</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="help-card">
+  <h4>3. 狙い方スタイルとAI独自度の仕組み</h4>
+  <table class="help-table">
+    <thead>
+      <tr><th>設定項目</th><th>内容と効果</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>標準バランス（初期設定）</strong></td><td>三連複の「1頭目の軸」をAI予測上位4頭以内の実力馬から選び、「2頭目の軸と相手5頭」に期待値の高い中穴を絡める王道スタイルです。</td></tr>
+      <tr><td><strong>堅実重視（的中率優先）</strong></td><td>軸2頭・BOX候補ともにAI実力上位馬に限定し、的中率の重みを強めて現実的な決着を狙います。</td></tr>
+      <tr><td><strong>穴狙い特化（高配当EV優先）</strong></td><td>的中率よりも期待値（EV）の大きさを優先して高配当を狙います。</td></tr>
+      <tr><td><strong>AI独自度（初期値 75%）</strong></td><td>AI純粋確率（75%）と単勝オッズから逆算した市場評価（25%）を合成します。</td></tr>
+    </tbody>
+  </table>
+</div>
+"""
+    st.markdown(help_html_1.strip(), unsafe_allow_html=True)
