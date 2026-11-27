@@ -59,10 +59,12 @@ def _decode_html(resp: requests.Response) -> str:
 
 
 def get_default_win5_date() -> date:
-    """直近の日曜日（当日が日曜なら当日、月〜土なら次の日曜）を返す"""
+    """土日WIN5対応：当日が土曜・日曜なら当日、平日（月〜金）なら次の土曜日を返す"""
     today = date.today()
-    days_until_sun = (6 - today.weekday()) % 7
-    return today + timedelta(days=days_until_sun)
+    if today.weekday() in (5, 6):
+        return today
+    days_until_sat = (5 - today.weekday()) % 7
+    return today + timedelta(days=days_until_sat)
 
 
 def fetch_win5_target_races(date_str: str, shutuba_scraper) -> tuple[list[dict], list[dict], str]:
@@ -164,6 +166,15 @@ def compute_race_entropy(probs: np.ndarray) -> float:
     return float(-np.sum(p * np.log(p)) / math.log(max(len(p), 2)))
 
 
+def classify_race_chaos(top1_p: float, top_gap: float, entropy: float) -> tuple[str, str]:
+    """AI1位の勝率・2位との差・エントロピーからレースの混戦度を3段階で診断する"""
+    if top1_p >= 0.25 or (top1_p >= 0.22 and top_gap >= 0.08) or entropy < 0.80:
+        return "堅め（1点突破向き）", "#047857"
+    if top1_p >= 0.195 or entropy < 0.87:
+        return "標準（1〜2頭向き）", "#b45309"
+    return "波乱・混戦（複数推奨）", "#dc2626"
+
+
 def evaluate_win5_races(
     target_races: list[dict],
     date_str: str,
@@ -239,32 +250,66 @@ def evaluate_win5_races(
     return evaluated
 
 
-def _select_candidates_for_race(race_df: pd.DataFrame, style_mode: str, exclude_fav1: bool, top_k: int = 6) -> pd.DataFrame:
+def _select_candidates_for_race(
+    race_df: pd.DataFrame,
+    style_mode: str,
+    exclude_fav1: bool,
+    force_ai1: bool = True,
+    top_k: int = 6,
+) -> pd.DataFrame:
+    """
+    レースごとのWIN5候補馬を順位付けする。
+    ・超大穴のedge_ratio暴走（単勝180倍がAI1位を追い抜く現象）を防ぐため、
+      実効エッジ比に上限キャップを設けつつ、AI勝率の重みを適正化する。
+    ・force_ai1=True（初期設定）のときは、必ずAI勝率1位（1番人気除外時は実質AI最上位）を
+      1枠目（1点突破・カバー筆頭）に固定し、2枠目以降に期待値×実力バランス上位を配置する。
+    """
     df = race_df.copy()
-    if style_mode == "solid":
-        gamma = 0.78
-        min_p = 0.045
-    elif style_mode == "upset":
-        gamma = 0.28
-        min_p = 0.015
-    else:
-        gamma = 0.48
-        min_p = 0.025
-
-    df["win5_score"] = df["edge_ratio"] * (df["ai_p"] ** gamma)
 
     if exclude_fav1:
-        cand = df[df["popularity"] != 1].copy()
-        if len(cand) < top_k:
-            cand = df.copy()
+        pool = df[df["popularity"] != 1].copy()
+        if len(pool) < top_k:
+            pool = df.copy()
     else:
-        cand = df.copy()
+        pool = df.copy()
 
-    filtered = cand[cand["ai_p"] >= min_p]
-    if len(filtered) >= top_k:
-        cand = filtered
+    if style_mode == "solid":
+        edge_cap = 2.0
+        min_p = 0.055
+        p_weight = 1.60
+    elif style_mode == "upset":
+        edge_cap = 3.8
+        min_p = 0.030
+        p_weight = 0.85
+    else:
+        edge_cap = 2.8
+        min_p = 0.040
+        p_weight = 1.25
 
-    return cand.sort_values("win5_score", ascending=False).head(top_k).reset_index(drop=True)
+    eff_edge = np.minimum(pool["edge_ratio"].to_numpy(dtype=float), edge_cap)
+    ai_p_arr = np.clip(pool["ai_p"].to_numpy(dtype=float), 1e-5, 1.0)
+    pool["win5_score"] = (ai_p_arr ** p_weight) * (eff_edge ** 0.70)
+
+    # AI1位（pool内の勝率最上位馬）を特定
+    pool_by_ai = pool.sort_values("ai_p", ascending=False).reset_index(drop=True)
+    ai1_row = pool_by_ai.iloc[[0]].copy()
+    ai1_hnum = int(ai1_row["horse_num"].iloc[0])
+
+    # 2番手以降の候補（極端な低確率馬を除外しつつ妙味＋実力で順位付け）
+    others = pool[pool["horse_num"].astype(int) != ai1_hnum].copy()
+    others_filtered = others[others["ai_p"] >= min_p]
+    if len(others_filtered) >= max(top_k - 1, 2):
+        others = others_filtered
+
+    if force_ai1:
+        others_sorted = others.sort_values("win5_score", ascending=False).head(max(top_k - 1, 1))
+        combined = pd.concat([ai1_row, others_sorted], ignore_index=True)
+        return combined.head(top_k).reset_index(drop=True)
+
+    filtered_all = pool[pool["ai_p"] >= min_p]
+    if len(filtered_all) >= top_k:
+        pool = filtered_all
+    return pool.sort_values("win5_score", ascending=False).head(top_k).reset_index(drop=True)
 
 
 def build_win5_recommendations(
@@ -272,6 +317,7 @@ def build_win5_recommendations(
     style_mode: str = "balanced",
     exclude_fav1: bool = False,
     carryover_boost: float = 1.0,
+    force_ai1: bool = True,
 ) -> dict:
     """
     3通り（300円）・5通り（500円）・10通り（1000円）について、
@@ -279,16 +325,28 @@ def build_win5_recommendations(
     """
     payout_rate = 0.70 * carryover_boost
     if style_mode == "solid":
-        gamma_combo = 0.55
-        min_ev_single = 0.80
+        prob_exp = 1.10
+        ev_exp = 0.45
+        min_ev_single = 0.75
     elif style_mode == "upset":
-        gamma_combo = 0.18
-        min_ev_single = 1.25
+        prob_exp = 0.45
+        ev_exp = 0.90
+        min_ev_single = 1.10
     else:
-        gamma_combo = 0.35
-        min_ev_single = 1.00
+        prob_exp = 0.78
+        ev_exp = 0.65
+        min_ev_single = 0.90
 
-    cands_list_6 = [_select_candidates_for_race(ev["df"], style_mode, exclude_fav1, top_k=6) for ev in evaluated_races]
+    cands_list_6 = [
+        _select_candidates_for_race(
+            ev["df"],
+            style_mode=style_mode,
+            exclude_fav1=exclude_fav1,
+            force_ai1=force_ai1,
+            top_k=6,
+        )
+        for ev in evaluated_races
+    ]
     cands_list_5 = [c.head(5) for c in cands_list_6]
 
     def solve_formation(slot_pattern: tuple[int, int, int, int, int]) -> dict:
@@ -313,6 +371,7 @@ def build_win5_recommendations(
 
             total_prob = 0.0
             ev_sum = 0.0
+            capped_ev_sum = 0.0
             ticket_rows = []
 
             for comb in combos:
@@ -335,6 +394,7 @@ def build_win5_recommendations(
 
                 total_prob += p_prod
                 ev_sum += ev
+                capped_ev_sum += min(ev, 25.0)
                 ticket_rows.append({
                     "組合せ": "-".join(f"{n:02d}" for n in nums),
                     "1着馬（1戦目〜5戦目）": " / ".join(f"{n:02d}{nm}" for n, nm in zip(nums, names)),
@@ -346,18 +406,19 @@ def build_win5_recommendations(
                 })
 
             avg_ev = ev_sum / max(len(combos), 1)
-            obj_score = avg_ev * (max(total_prob, 1e-9) ** gamma_combo)
+            avg_capped_ev = capped_ev_sum / max(len(combos), 1)
+            obj_score = (max(total_prob, 1e-9) ** prob_exp) * (max(avg_capped_ev, 0.1) ** ev_exp)
 
             if style_mode == "upset":
                 avg_fav1 = float(np.mean([t["_fav1_cnt"] for t in ticket_rows]))
                 if avg_fav1 >= 3.5:
-                    obj_score *= 0.60
+                    obj_score *= 0.70
 
             if obj_score > best_obj:
                 best_obj = obj_score
                 t_df = (
                     pd.DataFrame(ticket_rows)
-                    .sort_values("期待値(EV)", ascending=False)
+                    .sort_values(["AI的中率(%)", "期待値(EV)"], ascending=[False, False])
                     .drop(columns=["_fav1_cnt"])
                     .reset_index(drop=True)
                 )
@@ -376,27 +437,34 @@ def build_win5_recommendations(
 
     # 単品厳選用：5^5 = 最大3,125通りを全件計算
     row_lists_5 = [[row for _, row in cdf.iterrows()] for cdf in cands_list_5]
+    ai1_nums = [int(cdf["horse_num"].iloc[0]) for cdf in cands_list_5]
+
     all_single_rows = []
     for comb in itertools.product(*row_lists_5):
         p_prod = 1.0
         q_prod = 1.0
         fav1_cnt = 0
+        ai1_match_cnt = 0
         nums = []
         names = []
-        for h_row in comb:
+        for r_i, h_row in enumerate(comb):
+            h_num = int(h_row["horse_num"])
             p_prod *= float(h_row["ai_p"])
             q_prod *= float(h_row["mkt_q"])
             if int(h_row["popularity"]) == 1:
                 fav1_cnt += 1
-            nums.append(int(h_row["horse_num"]))
+            if h_num == ai1_nums[r_i]:
+                ai1_match_cnt += 1
+            nums.append(h_num)
             names.append(str(h_row["horse_name"]))
 
         est_odds = min(payout_rate / max(q_prod, 1e-10), 6_000_000.0)
         est_payout = int(round(est_odds * 100.0, -1))
         ev = p_prod * est_odds
-        score = ev * (max(p_prod, 1e-9) ** gamma_combo)
+        capped_ev = min(ev, 25.0)
+        score = (max(p_prod, 1e-9) ** prob_exp) * (max(capped_ev, 0.1) ** ev_exp)
         if style_mode == "upset" and fav1_cnt >= 4:
-            score *= 0.50
+            score *= 0.60
 
         all_single_rows.append({
             "組合せ": "-".join(f"{n:02d}" for n in nums),
@@ -405,6 +473,7 @@ def build_win5_recommendations(
             "想定払戻(円)": est_payout,
             "期待値(EV)": ev,
             "購入額(円)": 100,
+            "_ai1_cnt": ai1_match_cnt,
             "_score": score,
         })
 
@@ -413,7 +482,18 @@ def build_win5_recommendations(
 
     def solve_singles(n_tickets: int) -> dict:
         src = ev_filtered_df if len(ev_filtered_df) >= n_tickets else all_single_df
-        picked = src.head(n_tickets).drop(columns=["_score"]).reset_index(drop=True)
+        if force_ai1:
+            main_line = all_single_df[all_single_df["_ai1_cnt"] == 5].head(1)
+            if not main_line.empty:
+                main_combo = str(main_line["組合せ"].iloc[0])
+                rest = src[src["組合せ"] != main_combo].head(max(n_tickets - 1, 0))
+                picked = pd.concat([main_line, rest], ignore_index=True)
+            else:
+                picked = src.head(n_tickets).copy()
+        else:
+            picked = src.head(n_tickets).copy()
+
+        picked = picked.drop(columns=["_score", "_ai1_cnt"]).reset_index(drop=True)
         return {
             "tickets_df": picked,
             "total_cost": len(picked) * 100,
@@ -446,7 +526,7 @@ def build_win5_ipat_memo(
 ) -> str:
     style_txt = "フォーメーション最適化" if buy_style == "formation" else "単品厳選（バラ買い）"
     lines = [
-        f"【JRA WIN5 AI期待値予想】 {date_str} / {mode_key}通り（{res['total_cost']:,}円）",
+        f"【KAZUYAN AI WIN5期待値予想】 {date_str} / {mode_key}通り（{res['total_cost']:,}円）",
         f"買い方: {style_txt}",
         f"合成的中率: {res['total_prob_pct']:.4f}% / 平均期待値(EV): {res['avg_ev']:.2f} / 想定払戻: {res['min_payout']:,}〜{res['max_payout']:,}円",
         "-" * 54,
@@ -460,7 +540,8 @@ def build_win5_ipat_memo(
                 h_num = int(r["horse_num"])
                 h_name = str(r["horse_name"])
                 h_odds = float(r["win_odds"])
-                h_parts.append(f"{h_num:02d} {h_name}({h_odds:.1f}倍)")
+                h_rank = int(r["ai_rank"])
+                h_parts.append(f"{h_num:02d} {h_name}[AI{h_rank}位]({h_odds:.1f}倍)")
             h_txt = ", ".join(h_parts)
             lines.append(f"  {ev_r['leg']}戦目 [{ev_r['venue']}{ev_r['race_num']}R {ev_r['race_title']}]: {h_txt}")
     else:
@@ -488,13 +569,13 @@ def render_win5_tab(
     """03_app.py の WIN5タブ内を描画するメイン関数"""
     st.markdown("### WIN5 期待値最適化ツール（3通り・5通り・10通り）")
     st.caption(
-        "対象5レースのAI勝率と単勝オッズから『WIN5想定配当・期待値(EV)・各レース混戦度（エントロピー）』を算出し、"
-        "堅いレースは1点突破・波乱レースに点数を厚く配分する最適買い目を自動生成します。"
+        "対象5レースのAI勝率と単勝オッズから『WIN5想定配当・期待値(EV)・各レース混戦度』を算出し、"
+        "堅いレースはAI1位で1点突破・混戦レースにAI1位＋妙味馬を厚く配分する最適買い目を自動生成します。"
     )
 
     c_date, c_co, c_btn = st.columns([1.4, 1.4, 1.8])
     with c_date:
-        win5_date = st.date_input("WIN5 対象日（基本は日曜日）", value=get_default_win5_date(), key="win5_date_input")
+        win5_date = st.date_input("WIN5 対象日（土日祝開催日）", value=get_default_win5_date(), key="win5_date_input")
         win5_date_str = win5_date.strftime("%Y-%m-%d")
     with c_co:
         carryover_opt = st.selectbox(
@@ -513,7 +594,7 @@ def render_win5_tab(
             try:
                 targets, all_races, src_msg = fetch_win5_target_races(win5_date_str, shutuba_scraper)
                 if len(targets) < 5:
-                    st.warning(f"対象5レースを取得できませんでした（{src_msg}）。日曜・祝日のJRA開催日を選択してください。")
+                    st.warning(f"対象5レースを取得できませんでした（{src_msg}）。土日祝のJRA開催日を選択してください。")
                 else:
                     evaluated = evaluate_win5_races(
                         target_races=targets,
@@ -564,6 +645,7 @@ def render_win5_tab(
         ev_copy["df"] = df_c
         ev_copy["entropy"] = compute_race_entropy(df_c["ai_p"].to_numpy(dtype=float))
         ev_copy["top1_p"] = float(df_c["ai_p"].iloc[0])
+        ev_copy["top_gap"] = float(df_c["ai_p"].iloc[0] - (df_c["ai_p"].iloc[1] if len(df_c) > 1 else 0.0))
         re_evaluated.append(ev_copy)
 
     # 対象5レースの手動差し替え（必要時のみ）
@@ -594,27 +676,11 @@ def render_win5_tab(
                     st.session_state["win5_src_msg"] = "手動指定5レース"
                     st.rerun()
 
-    recs = build_win5_recommendations(
-        evaluated_races=re_evaluated,
-        style_mode=selected_style_mode,
-        exclude_fav1=exclude_fav1,
-        carryover_boost=co_boost,
-    )
-
     # 5レース混戦度診断カード
     st.markdown(f"#### 対象5レース AI混戦度診断（{loaded_date}）")
     leg_cols = st.columns(5)
     for col_box, ev in zip(leg_cols, re_evaluated):
-        ent = ev["entropy"]
-        if ent < 0.80:
-            chaos_tag = "堅め（1点突破向き）"
-            chaos_color = "#047857"
-        elif ent < 0.89:
-            chaos_tag = "標準"
-            chaos_color = "#b45309"
-        else:
-            chaos_tag = "波乱・混戦（複数推奨）"
-            chaos_color = "#dc2626"
+        chaos_tag, chaos_color = classify_race_chaos(ev["top1_p"], ev["top_gap"], ev["entropy"])
 
         top_h = ev["df"].iloc[0]
         surf_s = "ダ" if "ダ" in ev["surface"] else "芝"
@@ -628,13 +694,13 @@ def render_win5_tab(
 
         card_html = (
             f'<div style="background:#ffffff; border:1px solid #cbd5e1; border-top:4px solid {chaos_color}; '
-            f'border-radius:8px; padding:10px 12px; min-height:132px;">'
+            'border-radius:8px; padding:10px 12px; min-height:132px;">'
             f'<div style="font-size:0.78rem; color:#64748b; font-weight:700;">WIN5 {ev["leg"]}戦目 {start_t_esc}</div>'
             f'<div style="font-size:0.95rem; font-weight:800; color:#192442; margin:2px 0;">{venue_esc}{ev["race_num"]}R {title_esc}</div>'
             f'<div style="font-size:0.76rem; color:#475569;">{surf_s}{ev["distance"]}m ({odds_flag})</div>'
             f'<div style="font-size:0.76rem; font-weight:800; color:{chaos_color}; margin-top:4px;">{chaos_tag}</div>'
             f'<div style="font-size:0.78rem; color:#0f172a; margin-top:4px;">AI1位: <strong>{top_num:02d} {top_name_esc}</strong> ({top_pct:.1f}%)</div>'
-            f'</div>'
+            '</div>'
         )
         col_box.markdown(card_html, unsafe_allow_html=True)
 
@@ -659,17 +725,35 @@ def render_win5_tab(
             st.session_state["win5_mode_key"] = "10"
             st.rerun()
 
-    buy_style_label = st.radio(
-        "買い目構築方式",
-        [
-            "フォーメーション最適化（即PAT一括入力向き：1×1×1×1×3 / 1×1×1×1×5 / 1×1×1×2×5）",
-            "単品厳選（バラ買いEV特化：全3,125通りから期待値×的中率トップを直接抽出）",
-        ],
-        index=0,
-        horizontal=True,
-        key="win5_buy_style_radio",
-    )
+    opt_c1, opt_c2 = st.columns([2.2, 1.3])
+    with opt_c1:
+        buy_style_label = st.radio(
+            "買い目構築方式",
+            [
+                "フォーメーション最適化（即PAT一括入力向き：1×1×1×1×3 / 1×1×1×1×5 / 1×1×1×2×5）",
+                "単品厳選（バラ買いEV特化：全3,125通りから期待値×的中率トップを直接抽出）",
+            ],
+            index=0,
+            horizontal=True,
+            key="win5_buy_style_radio",
+        )
+    with opt_c2:
+        force_ai1 = st.checkbox(
+            "各レースのAI1位を買い目に必ず含める",
+            value=True,
+            key="win5_force_ai1_chk",
+            help="ONにすると1点突破・複数カバー問わず全レースでAI勝率1位を筆頭採用し、残りの枠で期待値の高い穴馬をカバーします。",
+        )
+
     buy_style_key = "formation" if "フォーメーション" in buy_style_label else "singles"
+
+    recs = build_win5_recommendations(
+        evaluated_races=re_evaluated,
+        style_mode=selected_style_mode,
+        exclude_fav1=exclude_fav1,
+        carryover_boost=co_boost,
+        force_ai1=force_ai1,
+    )
 
     active_res = recs[buy_style_key][cur_w5_mode]
     t_df = active_res["tickets_df"]
@@ -681,14 +765,17 @@ def render_win5_tab(
         alloc_str = " × ".join(str(x) for x in alloc)
         leg_lines_html = []
         for ev_r, k_n, pdf in zip(re_evaluated, alloc, active_res["picked_per_race"]):
-            chip_cls = "horse-chip horse-chip-axis" if k_n == 1 else "horse-chip"
             chip_parts = []
             for _, r in pdf.iterrows():
                 h_n = int(r["horse_num"])
                 h_nm = html.escape(str(r["horse_name"]))
                 h_od = float(r["win_odds"])
                 h_er = float(r["edge_ratio"])
-                chip_parts.append(f'<span class="{chip_cls}">{h_n:02d} {h_nm} ({h_od:.1f}倍 / EV比{h_er:.2f})</span>')
+                h_rk = int(r["ai_rank"])
+                is_axis_chip = (k_n == 1 or h_rk == 1)
+                chip_cls = "horse-chip horse-chip-axis" if is_axis_chip else "horse-chip"
+                rk_tag = "AI1位" if h_rk == 1 else f"AI{h_rk}位"
+                chip_parts.append(f'<span class="{chip_cls}">{h_n:02d} {h_nm} [{rk_tag}] ({h_od:.1f}倍 / EV比{h_er:.2f})</span>')
             chips_str = "".join(chip_parts)
             tag_txt = "1点突破" if k_n == 1 else f"{k_n}頭カバー"
             v_esc = html.escape(ev_r["venue"])
@@ -697,18 +784,18 @@ def render_win5_tab(
             )
         legs_body = "".join(leg_lines_html)
         card_html = (
-            f'<div class="bet-card">'
+            '<div class="bet-card">'
             f'<div class="bet-card-title">WIN5 {cur_w5_mode}通り フォーメーション最適化（{alloc_str} ＝ {total_cost_val:,}円 / 方針: {style_esc}）</div>'
             f'{legs_body}'
-            f'</div>'
+            '</div>'
         )
         st.markdown(card_html, unsafe_allow_html=True)
     else:
         card_html = (
-            f'<div class="bet-card">'
+            '<div class="bet-card">'
             f'<div class="bet-card-title">WIN5 {cur_w5_mode}通り 単品厳選（計 {len(t_df)}点 × 100円 ＝ {total_cost_val:,}円 / 方針: {style_esc}）</div>'
-            f'<div style="font-size:0.86rem; color:#475569;">5レース各上位候補の直積（最大3,125通り）を全件評価し、リスク調整期待値（EV × 的中率^γ）が最も高い{cur_w5_mode}通りを厳選しています。</div>'
-            f'</div>'
+            f'<div style="font-size:0.86rem; color:#475569;">5レース各上位候補の直積（最大3,125通り）から、AI1位本線を押さえつつリスク調整期待値が最も高い{cur_w5_mode}通りを厳選しています。</div>'
+            '</div>'
         )
         st.markdown(card_html, unsafe_allow_html=True)
 

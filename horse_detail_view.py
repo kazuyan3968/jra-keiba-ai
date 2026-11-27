@@ -76,7 +76,6 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
             result["error"] = "出馬表の過去走データに対象馬が見つかりませんでした。"
             return result
 
-        # 馬の個別ページURL取得
         h_link = target_tr.select_one("div.Horse02 a[href*='/horse/']") or target_tr.select_one("a[href*='/horse/']")
         if h_link and h_link.get("href"):
             href = h_link["href"]
@@ -92,7 +91,6 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
             if not full_txt or full_txt in ("-", "--"):
                 continue
 
-            # Data01: 日付・開催・着順
             d01 = ptd.select_one("div.Data01")
             rank_el = ptd.select_one("span.Num")
             rank_str = rank_el.get_text(strip=True) if rank_el else "-"
@@ -110,11 +108,9 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
                 if v_clean:
                     venue_val = v_clean.split()[0]
 
-            # Data02: レース名
             d02 = ptd.select_one("div.Data02")
             race_name = re.sub(r"\s+", " ", d02.get_text(" ", strip=True)) if d02 else "-"
 
-            # Data03: 頭数・馬番・人気・騎手・斤量
             d03 = ptd.select_one("div.Data03")
             d03_txt = re.sub(r"\s+", " ", d03.get_text(" ", strip=True)) if d03 else ""
             m_pop = re.search(r"(\d+)人", d03_txt)
@@ -125,7 +121,6 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
             jockey_kinryo = re.sub(r"\d+頭|\d+番|\d+人", "", d03_txt).strip()
             jockey_kinryo = re.sub(r"\s+", " ", jockey_kinryo) or "-"
 
-            # Data05: コース・距離・タイム・馬場
             d05 = ptd.select_one("div.Data05")
             d05_txt = re.sub(r"\s+", " ", d05.get_text(" ", strip=True)) if d05 else ""
             m_course = re.search(r"([芝ダ障]\d{3,4})", d05_txt)
@@ -135,7 +130,6 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
             m_cond = re.search(r"(良|稍重|稍|重|不良)", d05_txt)
             cond_val = m_cond.group(1) if m_cond else "-"
 
-            # Data06: 通過順・上がり3F・馬体重
             d06 = ptd.select_one("div.Data06")
             d06_txt = re.sub(r"\s+", " ", d06.get_text(" ", strip=True)) if d06 else ""
             m_agari = re.search(r"\((\d{2}\.\d)\)", d06_txt)
@@ -145,7 +139,6 @@ def fetch_past5_details(race_id: str, horse_num: int) -> dict:
             m_pass = re.search(r"^([\d-]+)", d06_txt)
             pass_val = m_pass.group(1) if m_pass else "-"
 
-            # Data07: 相手馬・着差
             d07 = ptd.select_one("div.Data07")
             d07_txt = re.sub(r"\s+", " ", d07.get_text(" ", strip=True)) if d07 else ""
             m_diff = re.search(r"\(([+-]?\d+\.\d)\)", d07_txt)
@@ -189,47 +182,61 @@ def analyze_feature_contributions(
     対象馬の特徴量グループを「同レース出走馬の平均／最頻値」に1グループずつ置換し、
     AI生勝率の変化量（プラス寄与・マイナス寄与）を実モデルから直接算出する。
     """
-    feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
+    df_reset = race_df.reset_index(drop=True)
+    feat_df, _ = train_model.create_features(df_reset, category_maps=category_maps)
+    feat_df = feat_df.reset_index(drop=True)
     base_raw = np.clip(model.predict_proba(feat_df[feature_cols])[:, 1], 1e-6, 1.0)
     base_probs = base_raw / base_raw.sum()
 
-    matches = race_df.index[race_df["horse_num"].astype(int) == int(target_horse_num)].tolist()
-    if not matches:
+    matches = np.where(df_reset["horse_num"].astype(int).to_numpy() == int(target_horse_num))[0]
+    if len(matches) == 0:
         return []
-    pos = race_df.index.get_loc(matches[0])
+    pos = int(matches[0])
     target_base_prob = float(base_probs[pos])
 
-    row_src = race_df.iloc[pos]
+    row_src = df_reset.iloc[pos]
+    p1_v = int(row_src.get("prev1_rank", 7))
+    p2_v = int(row_src.get("prev2_rank", 7))
+    p3_v = int(row_src.get("prev3_rank", 7))
+    td_v = float(row_src.get("prev1_time_diff", 0.8))
+    jk_v = str(row_src.get("jockey_id", "-"))
+    tr_v = str(row_src.get("trainer_id", "-"))
+    fr_v = int(row_src.get("frame_num", 1))
+    hn_v = int(row_src.get("horse_num", 1))
+    wc_v = float(row_src.get("weight_carried", 56.0))
+    hw_v = int(row_src.get("horse_weight", 476))
+    wd_v = int(row_src.get("weight_diff", 0))
+
     groups = [
         {
             "name": "近3走の着順・勢い",
             "cols": ["prev1_rank", "prev2_rank", "prev3_rank", "avg_prev_rank", "best_prev_rank", "rank_trend", "rel_prev_rank"],
-            "desc": f"前走{int(row_src.get('prev1_rank', 7))}着 / 2走前{int(row_src.get('prev2_rank', 7))}着 / 3走前{int(row_src.get('prev3_rank', 7))}着",
+            "desc": f"前走{p1_v}着 / 2走前{p2_v}着 / 3走前{p3_v}着",
         },
         {
             "name": "前走タイム差（内容の濃さ）",
             "cols": ["prev1_time_diff", "rel_time_diff"],
-            "desc": f"前走勝ち馬との差 {float(row_src.get('prev1_time_diff', 0.8)):.2f}秒",
+            "desc": f"前走勝ち馬との差 {td_v:.2f}秒",
         },
         {
             "name": "騎手の実績・コース相性",
             "cols": ["jockey_id"],
-            "desc": f"騎乗: {row_src.get('jockey_id', '-')}",
+            "desc": f"騎乗: {jk_v}",
         },
         {
             "name": "調教師（厩舎力）",
             "cols": ["trainer_id"],
-            "desc": f"厩舎: {row_src.get('trainer_id', '-')}",
+            "desc": f"厩舎: {tr_v}",
         },
         {
             "name": "枠順・馬番の有利不利",
             "cols": ["frame_num", "horse_num"],
-            "desc": f"{int(row_src.get('frame_num', 1))}枠 {int(row_src.get('horse_num', 1))}番",
+            "desc": f"{fr_v}枠 {hn_v}番",
         },
         {
             "name": "斤量・馬体重バランス",
             "cols": ["weight_carried", "horse_weight", "weight_diff", "abs_weight_diff", "weight_ratio"],
-            "desc": f"斤量{float(row_src.get('weight_carried', 56.0)):.1f}kg / 馬体重{int(row_src.get('horse_weight', 476))}kg ({int(row_src.get('weight_diff', 0)):+d})",
+            "desc": f"斤量{wc_v:.1f}kg / 馬体重{hw_v}kg ({wd_v:+d})",
         },
     ]
 
@@ -241,13 +248,20 @@ def analyze_feature_contributions(
             continue
 
         for c in valid_cols:
+            col_idx = mod_feat.columns.get_loc(c)
             if isinstance(mod_feat[c].dtype, pd.CategoricalDtype):
                 mode_vals = mod_feat[c].mode()
                 if len(mode_vals) > 0:
-                    mod_feat.iloc[pos, mod_feat.columns.get_loc(c)] = mode_vals.iloc[0]
+                    mod_feat.iloc[pos, col_idx] = mode_vals.iloc[0]
             else:
-                med_val = float(mod_feat[c].median())
-                mod_feat.iloc[pos, mod_feat.columns.get_loc(c)] = med_val
+                med_val = float(pd.to_numeric(mod_feat[c], errors="coerce").median())
+                if np.isnan(med_val):
+                    continue
+                if pd.api.types.is_integer_dtype(mod_feat[c].dtype):
+                    mod_feat.iloc[pos, col_idx] = int(round(med_val))
+                else:
+                    mod_feat[c] = mod_feat[c].astype(float)
+                    mod_feat.iloc[pos, col_idx] = float(med_val)
 
         alt_raw = np.clip(model.predict_proba(mod_feat)[:, 1], 1e-6, 1.0)
         alt_probs = alt_raw / alt_raw.sum()
@@ -284,7 +298,6 @@ def build_signal_explanation(
     mkt_implied_pct = (0.80 / max(odds, 1.05)) * 100.0
     gap_pct = win_p - mkt_implied_pct
 
-    # シグナル判定（03_app.py と完全一致）
     if ai_rank == 1 and not (exclude_fav1 and pop == 1):
         sig_label = "軸"
         sig_color = "#dc2626"
@@ -331,7 +344,6 @@ def build_signal_explanation(
             f"現時点のオッズでは積極的な投資妙味が薄い『様子見』判定です。"
         )
 
-    # 信頼度理由
     if ai_rank == 1 and win_p >= 22.0:
         conf_label = "S"
         conf_reason = f"AI1位かつ予測勝率が22%超（{win_p:.1f}%）の抜けた評価のため、最高ランク『S』です。"
@@ -343,9 +355,8 @@ def build_signal_explanation(
         conf_reason = f"AIトップ3（{ai_rank}位）かつ勝率9%以上（{win_p:.1f}%）のため、標準上位ランク『B』です。"
     else:
         conf_label = "-"
-        conf_reason = f"上位抜擢基準（AI3位以内＆勝率9%以上）を下回るため、信頼度ランクは付与されていません。"
+        conf_reason = "上位抜擢基準（AI3位以内＆勝率9%以上）を下回るため、信頼度ランクは付与されていません。"
 
-    # 箇条書きポイント
     bullets = []
     if gap_pct >= 2.0:
         bullets.append(
@@ -422,7 +433,6 @@ def render_horse_detail_page(
         unsafe_allow_html=True,
     )
 
-    # レースデータの読み込み（まず同じrace_idの保存CSVを確認し、無ければWeb取得）
     race_df = None
     if os.path.exists("data/upcoming_race.csv"):
         try:
@@ -441,7 +451,6 @@ def render_horse_detail_page(
                 st.error(f"レースデータの読み込みに失敗しました: {exc}")
                 return
 
-    # 推論・スコア計算（メイン画面と完全同一ロジック）
     feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
     raw_probs = model.predict_proba(feat_df[feature_cols])[:, 1]
     ai_pure_prob = raw_probs / raw_probs.sum()
@@ -473,9 +482,9 @@ def render_horse_detail_page(
     row = target_rows.iloc[0]
     exp = build_signal_explanation(row, race_df, ev_threshold=ev_threshold, exclude_fav1=exclude_fav1)
 
-    # 馬プロフィールヘッダーバナー
     waku = int(np.clip(row["frame_num"], 1, 8))
     h_name = html.escape(str(row["horse_name"]))
+    mark_esc = html.escape(str(row["印"]))
     jockey = html.escape(str(row["jockey_id"]))
     trainer = html.escape(str(row.get("trainer_id", "-")))
     venue = html.escape(str(row.get("venue", "")))
@@ -484,65 +493,73 @@ def render_horse_detail_page(
     surf = "ダ" if "ダ" in str(row.get("surface", "芝")) else "芝"
     dist = int(float(row.get("distance", 2000)))
     cond = html.escape(str(row.get("track_condition", "良")))
+    ai_rk = int(row["ai_rank"])
+    w_car = float(row["weight_carried"])
+    w_odd = float(row["win_odds"])
+    pop_i = int(row["popularity"])
+    ev_v = float(row["単勝期待値(EV)"])
+    ab_v = float(row["ability_score"])
 
     header_html = (
-        f'<div class="race-banner">'
-        f'<div>'
-        f'<div class="race-title-row">'
+        '<div class="race-banner">'
+        '<div>'
+        '<div class="race-title-row">'
         f'<span class="waku-badge waku-{waku}">{waku}</span>'
         f'<span class="race-venue-r">{int(horse_num)}番 {h_name}</span>'
-        f'<span class="race-time">印: {html.escape(str(row["印"]))} ／ AI {int(row["ai_rank"])}位</span>'
-        f'</div>'
-        f'<div class="race-meta-row" style="margin-top:8px;">'
+        f'<span class="race-time">印: {mark_esc} ／ AI {ai_rk}位</span>'
+        '</div>'
+        '<div class="race-meta-row" style="margin-top:8px;">'
         f'<span>{venue} {r_num}R {r_title}（{surf}{dist}m・{cond}）</span>'
-        f'<span>騎手: {jockey}（{float(row["weight_carried"]):.1f}kg）</span>'
+        f'<span>騎手: {jockey}（{w_car:.1f}kg）</span>'
         f'<span>厩舎: {trainer}</span>'
-        f'<span>単勝: {float(row["win_odds"]):.1f}倍（{int(row["popularity"])}人気）</span>'
-        f'</div>'
-        f'</div>'
-        f'<div class="ring-group">'
-        f'<div class="ring-circle ring-orange">'
-        f'<span class="ring-num-orange">{float(row["単勝期待値(EV)"]):.2f}</span>'
-        f'<span class="ring-label">単勝EV</span>'
-        f'</div>'
-        f'<div class="ring-circle ring-green">'
-        f'<span class="ring-num-green">{float(row["ability_score"]):.1f}</span>'
-        f'<span class="ring-label">能力値</span>'
-        f'</div>'
-        f'</div>'
-        f'</div>'
+        f'<span>単勝: {w_odd:.1f}倍（{pop_i}人気）</span>'
+        '</div>'
+        '</div>'
+        '<div class="ring-group">'
+        '<div class="ring-circle ring-orange">'
+        f'<span class="ring-num-orange">{ev_v:.2f}</span>'
+        '<span class="ring-label">単勝EV</span>'
+        '</div>'
+        '<div class="ring-circle ring-green">'
+        f'<span class="ring-num-green">{ab_v:.1f}</span>'
+        '<span class="ring-label">能力値</span>'
+        '</div>'
+        '</div>'
+        '</div>'
     )
     st.markdown(header_html, unsafe_allow_html=True)
 
-    # KPI指標
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("AI予測勝率", f"{float(row['pred_win_pct']):.1f}%", f"純粋AI: {float(row['ai_pure_pct']):.1f}%")
     k2.metric("2着内率（連対）", f"{float(row['pred_quinella_pct']):.1f}%")
     k3.metric("3着内率（複勝）", f"{float(row['pred_place_pct']):.1f}%")
     k4.metric("市場想定勝率", f"{exp['mkt_implied_pct']:.1f}%", f"乖離: {exp['gap_pct']:+.1f}pt")
-    k5.metric("単勝期待値 (EV)", f"{float(row['単勝期待値(EV)']):.2f}", f"基準: {ev_threshold:.2f}")
+    k5.metric("単勝期待値 (EV)", f"{ev_v:.2f}", f"基準: {ev_threshold:.2f}")
 
-    # ==========================================================================
-    # セクション1：なぜこのシグナルなのか？（判定理由 ＆ AI評価根拠）
-    # ==========================================================================
     st.markdown("### 1. シグナル判定理由・AI評価の根拠")
 
     bullets_html = "".join(f"<li style='margin-bottom:5px;'>{html.escape(b)}</li>" for b in exp["bullets"])
+    sig_bg = exp["sig_bg"]
+    sig_col = exp["sig_color"]
+    sig_lbl = html.escape(exp["sig_label"])
+    conf_lbl = html.escape(exp["conf_label"])
+    main_r_esc = html.escape(exp["main_reason"])
+    conf_r_esc = html.escape(exp["conf_reason"])
+
     sig_card_html = (
-        f'<div style="background:{exp["sig_bg"]}; border:1px solid #cbd5e1; border-left:6px solid {exp["sig_color"]}; '
-        f'border-radius:10px; padding:16px 20px; margin-bottom:16px;">'
-        f'<div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">'
-        f'<span style="background:{exp["sig_color"]}; color:#ffffff; font-weight:800; padding:4px 14px; border-radius:6px; font-size:0.95rem;">シグナル：{exp["sig_label"]}</span>'
-        f'<span style="font-weight:800; color:#192442; font-size:0.95rem;">信頼度ランク：{exp["conf_label"]}</span>'
-        f'</div>'
-        f'<p style="color:#0f172a; font-weight:700; font-size:0.96rem; line-height:1.6; margin-bottom:8px;">{html.escape(exp["main_reason"])}</p>'
-        f'<p style="color:#475569; font-size:0.86rem; margin-bottom:10px;"><strong>信頼度の根拠：</strong>{html.escape(exp["conf_reason"])}</p>'
+        f'<div style="background:{sig_bg}; border:1px solid #cbd5e1; border-left:6px solid {sig_col}; '
+        'border-radius:10px; padding:16px 20px; margin-bottom:16px;">'
+        '<div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">'
+        f'<span style="background:{sig_col}; color:#ffffff; font-weight:800; padding:4px 14px; border-radius:6px; font-size:0.95rem;">シグナル：{sig_lbl}</span>'
+        f'<span style="font-weight:800; color:#192442; font-size:0.95rem;">信頼度ランク：{conf_lbl}</span>'
+        '</div>'
+        f'<p style="color:#0f172a; font-weight:700; font-size:0.96rem; line-height:1.6; margin-bottom:8px;">{main_r_esc}</p>'
+        f'<p style="color:#475569; font-size:0.86rem; margin-bottom:10px;"><strong>信頼度の根拠：</strong>{conf_r_esc}</p>'
         f'<ul style="margin:0; padding-left:20px; color:#1e293b; font-size:0.88rem;">{bullets_html}</ul>'
-        f'</div>'
+        '</div>'
     )
     st.markdown(sig_card_html, unsafe_allow_html=True)
 
-    # AIモデルの特徴量別プラス・マイナス寄与度
     with st.spinner("AIモデルの評価内訳を計算中..."):
         contribs = analyze_feature_contributions(
             race_df=race_df,
@@ -576,9 +593,6 @@ def render_horse_detail_page(
             })
         st.dataframe(pd.DataFrame(c_rows), width="stretch", hide_index=True)
 
-    # ==========================================================================
-    # セクション2：過去5走の成績詳細
-    # ==========================================================================
     st.markdown("### 2. 過去5走の成績詳細")
     with st.spinner("過去5走の詳細成績を取得中..."):
         past_info = fetch_past5_details(race_id=str(race_id), horse_num=int(horse_num))
