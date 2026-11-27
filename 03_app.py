@@ -3,15 +3,18 @@ import importlib
 from importlib.util import module_from_spec, spec_from_file_location
 import html
 import os
+from urllib.parse import urlencode
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import harville_calculator
 import win5_engine
+import horse_detail_view
 
 importlib.reload(harville_calculator)
 importlib.reload(win5_engine)
+importlib.reload(horse_detail_view)
 from harville_calculator import (
     build_budget_mode_tickets,
     build_trio_strategies,
@@ -34,7 +37,7 @@ spec_tracker = spec_from_file_location("bet_tracker", "07_bet_tracker.py")
 bet_tracker = module_from_spec(spec_tracker)
 spec_tracker.loader.exec_module(bet_tracker)
 
-st.set_page_config(page_title="JRA KEIBA AI | 期待値＆買い目シミュレーター", layout="wide")
+st.set_page_config(page_title="KAZUYAN AI | 期待値＆買い目シミュレーター", layout="wide")
 
 # ==============================================================================
 # カスタムCSS（開催馬場ピルボタン・前R/次Rボタン・買い目タイル・出走表）
@@ -152,9 +155,10 @@ div[data-testid="stDeployButton"] {
 }
 .race-title-row {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 12px;
     margin-bottom: 4px;
+    flex-wrap: wrap;
 }
 .race-venue-r {
     font-size: 1.25rem;
@@ -329,9 +333,18 @@ div[data-testid="stDeployButton"] {
 .pop-tag { font-size: 0.72rem; color: #2563eb; font-weight: 600; line-height: 1.1; }
 .odds-val { font-size: 1.02rem; font-weight: 800; color: #111827; line-height: 1.2; }
 
-/* 馬名＆騎手2段 */
+/* 馬名＆騎手2段（馬名リンク） */
 .horse-cell { text-align: left !important; padding-left: 12px !important; }
 .horse-title { font-weight: 800; font-size: 0.96rem; color: #1d4ed8; line-height: 1.25; }
+.horse-link {
+    color: #1d4ed8 !important;
+    text-decoration: none !important;
+    cursor: pointer;
+}
+.horse-link:hover {
+    text-decoration: underline !important;
+    color: #1e40af !important;
+}
 .jockey-sub { font-size: 0.76rem; color: #64748b; margin-top: 2px; }
 
 /* シグナルバッジ */
@@ -566,6 +579,59 @@ feature_cols = artifact["feature_cols"]
 category_maps = artifact["category_maps"]
 train_status = get_training_data_status(artifact, model_mtime)
 
+
+# ==============================================================================
+# 馬名クリックで開かれた別タブ（個別馬AI診断・過去5走レポート）のルーティング
+# ==============================================================================
+def _get_query_param(key: str, default: str = "") -> str:
+    try:
+        val = st.query_params.get(key, default)
+        if isinstance(val, list):
+            return str(val[0]) if val else default
+        return str(val) if val is not None else default
+    except Exception:
+        return default
+
+
+if _get_query_param("view") == "horse":
+    q_rid = _get_query_param("race_id", "")
+    q_date = _get_query_param("date", date.today().strftime("%Y-%m-%d"))
+    q_hnum_s = _get_query_param("horse_num", "1")
+    q_aiw_s = _get_query_param("ai_w", "0.75")
+    q_ev_s = _get_query_param("ev_th", "1.15")
+    q_ex1_s = _get_query_param("ex1", "0")
+
+    try:
+        q_hnum = int(q_hnum_s)
+    except ValueError:
+        q_hnum = 1
+    try:
+        q_aiw = float(q_aiw_s)
+    except ValueError:
+        q_aiw = 0.75
+    try:
+        q_ev = float(q_ev_s)
+    except ValueError:
+        q_ev = 1.15
+    q_ex1 = (q_ex1_s == "1")
+
+    horse_detail_view.render_horse_detail_page(
+        race_id=q_rid,
+        date_str=q_date,
+        horse_num=q_hnum,
+        ai_weight=q_aiw,
+        ev_threshold=q_ev,
+        exclude_fav1=q_ex1,
+        model=model,
+        feature_cols=feature_cols,
+        category_maps=category_maps,
+        train_model=train_model,
+        shutuba_scraper=shutuba_scraper,
+        calculate_horse_place_probs=calculate_horse_place_probs,
+    )
+    st.stop()
+
+
 # ==============================================================================
 # サイドバー：開催日＆レース取得・設定
 # ==============================================================================
@@ -589,7 +655,6 @@ if data_source == "WebからJRA出馬表・オッズを自動取得":
                 if not races_found:
                     st.sidebar.warning("指定日のJRA開催レースが見つかりませんでした。土日祝の日付を指定してください。")
                 else:
-                    # 取得直後に最初の開催場のメインレース(11R)または先頭レースを自動表示
                     venues_avail = list(dict.fromkeys(r["venue"] for r in races_found))
                     first_v = venues_avail[0]
                     v_races = [r for r in races_found if r["venue"] == first_v]
@@ -771,21 +836,23 @@ race_df["signal_html"] = sigs
 race_df["conf_html"] = confs
 
 # ==============================================================================
-# トップナビゲーションバー
+# トップナビゲーションバー（ブランド名: KAZUYAN AI）
 # ==============================================================================
 data_pill_cls = "nav-pill-real" if train_status["is_real"] else "nav-pill-warn"
 style_short_badge = style_label.split("（")[0]
-navbar_html = f"""
-<div class="top-navbar">
-  <div class="brand">JRA KEIBA AI</div>
-  <div class="nav-badges">
-    <span class="{data_pill_cls}">{html.escape(train_status['badge'])}</span>
-    <span class="nav-pill">方針: {html.escape(style_short_badge)}</span>
-    <span class="nav-pill">AI独自度: {int(ai_weight * 100)}%</span>
-  </div>
-</div>
-"""
-st.markdown(navbar_html.strip(), unsafe_allow_html=True)
+badge_esc = html.escape(train_status["badge"])
+style_esc = html.escape(style_short_badge)
+navbar_html = (
+    '<div class="top-navbar">'
+    '<div class="brand">KAZUYAN AI</div>'
+    '<div class="nav-badges">'
+    f'<span class="{data_pill_cls}">{badge_esc}</span>'
+    f'<span class="nav-pill">方針: {style_esc}</span>'
+    f'<span class="nav-pill">AI独自度: {int(ai_weight * 100)}%</span>'
+    '</div>'
+    '</div>'
+)
+st.markdown(navbar_html, unsafe_allow_html=True)
 
 tab_main, tab_win5, tab_stats, tab_help = st.tabs([
     "レース予想・買い目",
@@ -815,7 +882,6 @@ with tab_main:
         if active_venue not in venues_in_day:
             active_venue = venues_in_day[0]
 
-        # 1段目：開催馬場ボタン（例：福島 | 京都 | 東京） ＋ 最新更新ボタン
         st.markdown('<div class="venue-nav-zone"></div>', unsafe_allow_html=True)
         v_cols = st.columns(len(venues_in_day) + 1)
         for idx_v, v_name in enumerate(venues_in_day):
@@ -851,7 +917,6 @@ with tab_main:
                         except Exception as e:
                             st.error(f"更新エラー: {e}")
 
-        # 2段目：← 前R | 1R〜12R クイック切替 | 次R →
         venue_races = sorted(
             [r for r in fetched_list if r["venue"] == active_venue],
             key=lambda x: x["race_num"],
@@ -953,42 +1018,49 @@ with tab_main:
     max_ev_val = float(race_df["単勝期待値(EV)"].max())
     active_candidates = int((race_df["ai_rank"] <= 6).sum())
 
-    banner_html = f"""
-    <div class="race-banner">
-      <div>
-        <div class="race-title-row">
-          <span class="race-venue-r">{html.escape(str(r_info['venue']))} {race_num_label}</span>
-          <span class="race-time">{html.escape(start_time_display)}</span>
-        </div>
-        <div class="race-name-main">{html.escape(race_title_display)}</div>
-        <div class="race-meta-row">
-          <span>{surface_short} {int(r_info['distance'])}m</span>
-          <span>{len(race_df)}頭</span>
-          <span class="cond-badge">{surface_short}:{html.escape(str(r_info['track_condition']))}</span>
-          <span class="status-badge">{html.escape(odds_badge_text)}</span>
-        </div>
-      </div>
-      <div class="ring-group">
-        <div class="ring-circle ring-orange">
-          <span class="ring-num-orange">{max_ev_val:.2f}</span>
-          <span class="ring-label">最高EV</span>
-        </div>
-        <div class="ring-circle ring-green">
-          <span class="ring-num-green">{active_candidates}</span>
-          <span class="ring-label">有力候補</span>
-        </div>
-      </div>
-    </div>
-    """
-    st.markdown(banner_html.strip(), unsafe_allow_html=True)
+    venue_esc = html.escape(str(r_info["venue"]))
+    time_esc = html.escape(start_time_display)
+    rtitle_esc = html.escape(race_title_display)
+    cond_esc = html.escape(str(r_info["track_condition"]))
+    odds_b_esc = html.escape(odds_badge_text)
+    dist_i = int(r_info["distance"])
+
+    banner_html = (
+        '<div class="race-banner">'
+        '<div>'
+        '<div class="race-title-row">'
+        f'<span class="race-venue-r">{venue_esc} {race_num_label}</span>'
+        f'<span class="race-time">{time_esc}</span>'
+        '</div>'
+        f'<div class="race-name-main">{rtitle_esc}</div>'
+        '<div class="race-meta-row">'
+        f'<span>{surface_short} {dist_i}m</span>'
+        f'<span>{len(race_df)}頭</span>'
+        f'<span class="cond-badge">{surface_short}:{cond_esc}</span>'
+        f'<span class="status-badge">{odds_b_esc}</span>'
+        '</div>'
+        '</div>'
+        '<div class="ring-group">'
+        '<div class="ring-circle ring-orange">'
+        f'<span class="ring-num-orange">{max_ev_val:.2f}</span>'
+        '<span class="ring-label">最高EV</span>'
+        '</div>'
+        '<div class="ring-circle ring-green">'
+        f'<span class="ring-num-green">{active_candidates}</span>'
+        '<span class="ring-label">有力候補</span>'
+        '</div>'
+        '</div>'
+        '</div>'
+    )
+    st.markdown(banner_html, unsafe_allow_html=True)
 
     def render_horse_chips(nums: list[int], df_horses: pd.DataFrame, is_axis: bool = False) -> str:
         num_to_name = dict(zip(df_horses["horse_num"].astype(int), df_horses["horse_name"]))
         cls = "horse-chip horse-chip-axis" if is_axis else "horse-chip"
-        chips = [
-            f'<span class="{cls}">{n:02d} {html.escape(str(num_to_name.get(n, "")))}</span>'
-            for n in nums
-        ]
+        chips = []
+        for n in nums:
+            nm_esc = html.escape(str(num_to_name.get(n, "")))
+            chips.append(f'<span class="{cls}">{n:02d} {nm_esc}</span>')
         return "".join(chips)
 
     # ==========================================================================
@@ -1048,13 +1120,13 @@ with tab_main:
     if current_mode == "200":
         m200 = budget_modes["mode_200"]
         df_200 = m200["tickets_df"]
-        card_200 = f"""
-    <div class="bet-card">
-      <div class="bet-card-title">200円モード：期待値(EV)と的中率バランス超厳選2点（計 {len(df_200)}点 × 100円 ＝ {m200['total_cost']}円）</div>
-      <div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{html.escape(style_short_badge)}）に基づき、全券種から最優先の2点だけを厳選抽出しています。</div>
-    </div>
-    """
-        st.markdown(card_200.strip(), unsafe_allow_html=True)
+        card_200 = (
+            '<div class="bet-card">'
+            f'<div class="bet-card-title">200円モード：期待値(EV)と的中率バランス超厳選2点（計 {len(df_200)}点 × 100円 ＝ {m200["total_cost"]}円）</div>'
+            f'<div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{style_esc}）に基づき、全券種から最優先の2点だけを厳選抽出しています。</div>'
+            '</div>'
+        )
+        st.markdown(card_200, unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("合計購入金額", f"{m200['total_cost']} 円（{len(df_200)}点）")
         c2.metric("平均期待値(EV)", f"{df_200['期待値(EV)'].mean():.2f}" if not df_200.empty else "-")
@@ -1069,14 +1141,16 @@ with tab_main:
     elif current_mode == "500":
         m500 = budget_modes["mode_500"]
         df_500 = m500["tickets_df"]
-        card_500 = f"""
-    <div class="bet-card">
-      <div class="bet-card-title">500円モード：3連複 2頭軸5頭流し（計 {len(df_500)}点 × 100円 ＝ {m500['total_cost']}円）</div>
-      <div style="margin-bottom:6px;"><strong>軸2頭：</strong> {render_horse_chips(m500['axis'], race_df, is_axis=True)}</div>
-      <div><strong>相手5頭：</strong> {render_horse_chips(m500['followers'], race_df, is_axis=False)}</div>
-    </div>
-    """
-        st.markdown(card_500.strip(), unsafe_allow_html=True)
+        axis_html = render_horse_chips(m500["axis"], race_df, is_axis=True)
+        foll_html = render_horse_chips(m500["followers"], race_df, is_axis=False)
+        card_500 = (
+            '<div class="bet-card">'
+            f'<div class="bet-card-title">500円モード：3連複 2頭軸5頭流し（計 {len(df_500)}点 × 100円 ＝ {m500["total_cost"]}円）</div>'
+            f'<div style="margin-bottom:6px;"><strong>軸2頭：</strong> {axis_html}</div>'
+            f'<div><strong>相手5頭：</strong> {foll_html}</div>'
+            '</div>'
+        )
+        st.markdown(card_500, unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("合計購入金額", f"{m500['total_cost']} 円（{len(df_500)}点）")
         c2.metric("合成的中率", f"{df_500['三連複的中率(%)'].sum():.2f}%")
@@ -1091,13 +1165,13 @@ with tab_main:
     elif current_mode == "300":
         m300 = budget_modes["mode_300"]
         df_300 = m300["tickets_df"]
-        card_300 = f"""
-    <div class="bet-card">
-      <div class="bet-card-title">300円モード：期待値(EV)と的中率バランス厳選3点（計 {len(df_300)}点 × 100円 ＝ {m300['total_cost']}円）</div>
-      <div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{html.escape(style_short_badge)}）に基づき、全券種から現実的かつ妙味のある3点を抽出しています。</div>
-    </div>
-    """
-        st.markdown(card_300.strip(), unsafe_allow_html=True)
+        card_300 = (
+            '<div class="bet-card">'
+            f'<div class="bet-card-title">300円モード：期待値(EV)と的中率バランス厳選3点（計 {len(df_300)}点 × 100円 ＝ {m300["total_cost"]}円）</div>'
+            f'<div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{style_esc}）に基づき、全券種から現実的かつ妙味のある3点を抽出しています。</div>'
+            '</div>'
+        )
+        st.markdown(card_300, unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("合計購入金額", f"{m300['total_cost']} 円（{len(df_300)}点）")
         c2.metric("平均期待値(EV)", f"{df_300['期待値(EV)'].mean():.2f}")
@@ -1114,15 +1188,19 @@ with tab_main:
         df_trio_2000 = m2000["trio_df"]
         df_exacta_2000 = m2000["exacta_df"]
         df_wide_2000 = m2000["wide_df"]
-        card_2000 = f"""
-    <div class="bet-card">
-      <div class="bet-card-title">2000円モード：3券種フルパッケージ（計 20点 × 100円 ＝ {m2000['total_cost']:,}円）</div>
-      <div style="margin-bottom:5px;"><strong>1. 3連複 2頭軸5頭流し（500円）：</strong> 軸 {render_horse_chips(m2000['trio_axis'], race_df, is_axis=True)} ／ 相手 {render_horse_chips(m2000['trio_followers'], race_df)}</div>
-      <div style="margin-bottom:5px;"><strong>2. 馬単 4頭ボックス（1200円）：</strong> {render_horse_chips(m2000['exacta_box'], race_df)}</div>
-      <div><strong>3. ワイド 3頭ボックス（300円）：</strong> {render_horse_chips(m2000['wide_box'], race_df)}</div>
-    </div>
-    """
-        st.markdown(card_2000.strip(), unsafe_allow_html=True)
+        t_ax_html = render_horse_chips(m2000["trio_axis"], race_df, is_axis=True)
+        t_fl_html = render_horse_chips(m2000["trio_followers"], race_df)
+        ex_bx_html = render_horse_chips(m2000["exacta_box"], race_df)
+        wd_bx_html = render_horse_chips(m2000["wide_box"], race_df)
+        card_2000 = (
+            '<div class="bet-card">'
+            f'<div class="bet-card-title">2000円モード：3券種フルパッケージ（計 20点 × 100円 ＝ {m2000["total_cost"]:,}円）</div>'
+            f'<div style="margin-bottom:5px;"><strong>1. 3連複 2頭軸5頭流し（500円）：</strong> 軸 {t_ax_html} ／ 相手 {t_fl_html}</div>'
+            f'<div style="margin-bottom:5px;"><strong>2. 馬単 4頭ボックス（1200円）：</strong> {ex_bx_html}</div>'
+            f'<div><strong>3. ワイド 3頭ボックス（300円）：</strong> {wd_bx_html}</div>'
+            '</div>'
+        )
+        st.markdown(card_2000, unsafe_allow_html=True)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("合計投資額", f"{m2000['total_cost']:,} 円（20点）")
         c2.metric("3連複 5点合成的中率", f"{df_trio_2000['三連複的中率(%)'].sum():.2f}%")
@@ -1204,9 +1282,12 @@ with tab_main:
         st.code(ipat_data["ipat_csv"].strip(), language="text")
 
     # ==========================================================================
-    # 出走表テーブル
+    # 出走表テーブル（馬名クリックで別タブに過去5走＋シグナル判定理由を表示）
     # ==========================================================================
-    st.markdown(f"### 出走表 <span style='font-size:0.88rem; color:#64748b; font-weight:600;'>{len(race_df)}頭</span>", unsafe_allow_html=True)
+    st.markdown(
+        f"### 出走表 <span style='font-size:0.88rem; color:#64748b; font-weight:600;'>{len(race_df)}頭（馬名クリックで過去5走＆シグナル理由を別タブ表示）</span>",
+        unsafe_allow_html=True,
+    )
 
     table_rows_html = []
     for _, r in race_df.iterrows():
@@ -1229,15 +1310,30 @@ with tab_main:
         ev_val = float(r["単勝期待値(EV)"])
         ev_style = "color:#dc2626; font-weight:800;" if ev_val >= ev_threshold else "color:#475569; font-weight:600;"
 
+        detail_qs = urlencode({
+            "view": "horse",
+            "race_id": race_id_str,
+            "date": str(r_info["date"]),
+            "horse_num": str(umaban),
+            "ai_w": f"{ai_weight:.2f}",
+            "ev_th": f"{ev_threshold:.2f}",
+            "ex1": "1" if exclude_fav1 else "0",
+        })
+        detail_href = f"?{detail_qs}"
+        mark_esc = html.escape(str(r["印"]))
+        hname_esc = html.escape(str(r["horse_name"]))
+        jock_esc = html.escape(str(r["jockey_id"]))
+
         row_str = (
             f'<tr class="{row_cls}">'
             f'<td><div class="pop-tag">{int(r["popularity"])}人気</div><div class="odds-val">{float(r["win_odds"]):.1f}</div></td>'
             f'<td style="font-weight:800;">{ai_rank}</td>'
             f'<td><span class="waku-badge waku-{waku}">{waku}</span></td>'
             f'<td><span class="{umaban_cls}">{umaban}</span></td>'
-            f'<td><span class="mark-badge">{html.escape(str(r["印"]))}</span></td>'
-            f'<td class="horse-cell"><div class="horse-title">{html.escape(str(r["horse_name"]))}</div>'
-            f'<div class="jockey-sub">{html.escape(str(r["jockey_id"]))} &nbsp; {float(r["weight_carried"]):.1f}</div></td>'
+            f'<td><span class="mark-badge">{mark_esc}</span></td>'
+            f'<td class="horse-cell">'
+            f'<div class="horse-title"><a class="horse-link" href="{detail_href}" target="_blank" rel="noopener noreferrer">{hname_esc}</a></div>'
+            f'<div class="jockey-sub">{jock_esc} &nbsp; {float(r["weight_carried"]):.1f}</div></td>'
             f'<td>{r["signal_html"]}</td>'
             f'<td>{r["conf_html"]}</td>'
             f'<td><div class="ability-wrap"><span class="ability-num">{ability:.1f}</span>'
@@ -1250,6 +1346,7 @@ with tab_main:
         )
         table_rows_html.append(row_str)
 
+    tbody_str = "".join(table_rows_html)
     shutuba_html = (
         '<div class="shutuba-wrapper"><table class="shutuba-table">'
         '<thead><tr>'
@@ -1258,7 +1355,7 @@ with tab_main:
         '<th>シグナル</th><th>信頼度</th><th>能力値 ▼</th>'
         '<th>勝率 ▼</th><th>2着内率 ▼</th><th>3着内率 ▼</th><th>単勝EV ▼</th>'
         '</tr></thead>'
-        f'<tbody>{"".join(table_rows_html)}</tbody>'
+        f'<tbody>{tbody_str}</tbody>'
         '</table></div>'
     )
     st.markdown(shutuba_html, unsafe_allow_html=True)
@@ -1407,7 +1504,7 @@ with tab_stats:
             st.download_button(
                 label="戦績履歴CSVをダウンロード",
                 data=hist_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name="jra_ai_bet_history.csv",
+                file_name="kazuyan_ai_bet_history.csv",
                 mime="text/csv",
                 width="stretch",
             )
@@ -1573,45 +1670,42 @@ with tab_stats:
 # タブ4：ヘルプ・算出ロジック解説画面
 # ==============================================================================
 with tab_help:
-    help_html_1 = f"""
-<div class="help-card">
-  <h4>1. 現在のAIモデルと学習データの状態</h4>
-  <p style="margin-bottom:8px;"><strong>ステータス：</strong> {html.escape(train_status['badge'])}</p>
-  <p style="color:#475569; margin-bottom:10px;">{html.escape(train_status['detail'])}</p>
-  <div class="formula-box">
-    JRA実データ5年分を収集して再学習するコマンド手順:<br>
-1. python 05_scrape_history.py --start-date 2022-01-01 --end-date 2026-11-24 --min-race-num 1<br>
-2. python 02_train_model.py
-  </div>
-</div>
-
-<div class="help-card">
-  <h4>2. 開催馬場ボタン・レース切替ボタンの使い方</h4>
-  <table class="help-table">
-    <thead>
-      <tr><th>ボタン・表示</th><th>動作内容</th></tr>
-    </thead>
-    <tbody>
-      <tr><td><strong>開催馬場ボタン（東京・京都 等）</strong></td><td>開催日のレース一覧を取得すると、当日の開催場が丸角ボタンで並びます。タップするだけで別会場の同R（またはメインR）へ即座に切り替わります。</td></tr>
-      <tr><td><strong>← 前R / 1R〜12R / 次R →</strong></td><td>選択中の競馬場の前後のレースや指定R番号へワンタップで移動し、出馬表と全オッズを自動取得します。</td></tr>
-      <tr><td><strong>最新更新</strong></td><td>発走直前のオッズ変動を取り込むため、現在表示しているレースのオッズを再取得します。</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<div class="help-card">
-  <h4>3. 狙い方スタイルとAI独自度の仕組み</h4>
-  <table class="help-table">
-    <thead>
-      <tr><th>設定項目</th><th>内容と効果</th></tr>
-    </thead>
-    <tbody>
-      <tr><td><strong>標準バランス（初期設定）</strong></td><td>三連複の「1頭目の軸」をAI予測上位4頭以内の実力馬から選び、「2頭目の軸と相手5頭」に期待値の高い中穴を絡める王道スタイルです。</td></tr>
-      <tr><td><strong>堅実重視（的中率優先）</strong></td><td>軸2頭・BOX候補ともにAI実力上位馬に限定し、的中率の重みを強めて現実的な決着を狙います。</td></tr>
-      <tr><td><strong>穴狙い特化（高配当EV優先）</strong></td><td>的中率よりも期待値（EV）の大きさを優先して高配当を狙います。</td></tr>
-      <tr><td><strong>AI独自度（初期値 75%）</strong></td><td>AI純粋確率（75%）と単勝オッズから逆算した市場評価（25%）を合成します。</td></tr>
-    </tbody>
-  </table>
-</div>
-"""
-    st.markdown(help_html_1.strip(), unsafe_allow_html=True)
+    t_badge_esc = html.escape(train_status["badge"])
+    t_detail_esc = html.escape(train_status["detail"])
+    help_html_1 = (
+        '<div class="help-card">'
+        '<h4>1. KAZUYAN AI モデルと学習データの状態</h4>'
+        f'<p style="margin-bottom:8px;"><strong>ステータス：</strong> {t_badge_esc}</p>'
+        f'<p style="color:#475569; margin-bottom:10px;">{t_detail_esc}</p>'
+        '<div class="formula-box">'
+        'JRA実データ5年分を収集して再学習するコマンド手順:<br>'
+        '1. python 05_scrape_history.py --start-date 2022-01-01 --end-date 2026-11-24 --min-race-num 1<br>'
+        '2. python 02_train_model.py'
+        '</div>'
+        '</div>'
+        '<div class="help-card">'
+        '<h4>2. 馬名クリック詳細レポート＆ボタン操作の使い方</h4>'
+        '<table class="help-table">'
+        '<thead><tr><th>機能・ボタン</th><th>動作内容</th></tr></thead>'
+        '<tbody>'
+        '<tr><td><strong>出走表の馬名クリック</strong></td><td>別タブで個別馬の診断ページが開き、過去5走の詳細成績と「なぜ軸・穴注目・紐候補・様子見のシグナルになったのか」のAI特徴量別根拠を確認できます。</td></tr>'
+        '<tr><td><strong>開催馬場ボタン（東京・京都 等）</strong></td><td>開催日のレース一覧を取得すると、当日の開催場が丸角ボタンで並びます。タップするだけで別会場の同R（またはメインR）へ即座に切り替わります。</td></tr>'
+        '<tr><td><strong>← 前R / 1R〜12R / 次R →</strong></td><td>選択中の競馬場の前後のレースや指定R番号へワンタップで移動し、出馬表と全オッズを自動取得します。</td></tr>'
+        '<tr><td><strong>最新更新</strong></td><td>発走直前のオッズ変動を取り込むため、現在表示しているレースのオッズを再取得します。</td></tr>'
+        '</tbody>'
+        '</table>'
+        '</div>'
+        '<div class="help-card">'
+        '<h4>3. 狙い方スタイルとAI独自度の仕組み</h4>'
+        '<table class="help-table">'
+        '<thead><tr><th>設定項目</th><th>内容と効果</th></tr></thead>'
+        '<tbody>'
+        '<tr><td><strong>標準バランス（初期設定）</strong></td><td>三連複の「1頭目の軸」をAI予測上位4頭以内の実力馬から選び、「2頭目の軸と相手5頭」に期待値の高い中穴を絡める王道スタイルです。</td></tr>'
+        '<tr><td><strong>堅実重視（的中率優先）</strong></td><td>軸2頭・BOX候補ともにAI実力上位馬に限定し、的中率の重みを強めて現実的な決着を狙います。</td></tr>'
+        '<tr><td><strong>穴狙い特化（高配当EV優先）</strong></td><td>的中率よりも期待値（EV）の大きさを優先して高配当を狙います。</td></tr>'
+        '<tr><td><strong>AI独自度（初期値 75%）</strong></td><td>AI純粋確率（75%）と単勝オッズから逆算した市場評価（25%）を合成します。</td></tr>'
+        '</tbody>'
+        '</table>'
+        '</div>'
+    )
+    st.markdown(help_html_1, unsafe_allow_html=True)
