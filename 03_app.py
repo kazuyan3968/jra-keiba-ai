@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import harville_calculator
+import win5_engine
 
 importlib.reload(harville_calculator)
+importlib.reload(win5_engine)
 from harville_calculator import (
     build_budget_mode_tickets,
     build_trio_strategies,
@@ -478,42 +480,59 @@ div[data-testid="stDeployButton"] {
 
 
 @st.cache_resource
-def load_artifact():
+def load_artifact(model_mtime: float):
     return joblib.load("models/keiba_lgbm.pkl")
 
 
 @st.cache_data(ttl=30)
-def get_training_data_status() -> dict:
+def get_training_data_status(_artifact: dict | None = None, model_mtime: float = 0.0) -> dict:
     hist_path = "data/historical_races.csv"
-    if not os.path.exists(hist_path):
-        return {
-            "is_real": False,
-            "badge": "学習データ未確認",
-            "detail": "data/historical_races.csv が見つかりません。",
-        }
-    try:
-        df_h = pd.read_csv(hist_path, usecols=["race_id", "date", "horse_name"])
-        sample_ratio = df_h["horse_name"].astype(str).str.startswith("サンプルホース").mean()
-        n_races = int(df_h["race_id"].nunique())
-        min_d = str(df_h["date"].min())
-        max_d = str(df_h["date"].max())
-        if sample_ratio > 0.5:
+    if os.path.exists(hist_path):
+        try:
+            df_h = pd.read_csv(hist_path, usecols=["race_id", "date", "horse_name"])
+            sample_ratio = df_h["horse_name"].astype(str).str.startswith("サンプルホース").mean()
+            n_races = int(df_h["race_id"].nunique())
+            min_d = str(df_h["date"].min())
+            max_d = str(df_h["date"].max())
+            if sample_ratio > 0.5:
+                return {
+                    "is_real": False,
+                    "badge": "学習元: テスト用サンプルデータ",
+                    "detail": f"現在は 01_data_loader.py で生成した仮想データ（{n_races:,}レース / {min_d} 〜 {max_d}）で学習しています。",
+                }
             return {
-                "is_real": False,
-                "badge": "学習元: テスト用サンプルデータ",
-                "detail": f"現在は 01_data_loader.py で生成した仮想データ（{n_races:,}レース / {min_d} 〜 {max_d}）で学習しています。",
+                "is_real": True,
+                "badge": f"学習元: JRA実データ ({n_races:,}R)",
+                "detail": f"実際のJRA過去レース結果（{n_races:,}レース / 期間: {min_d} 〜 {max_d}）を使用して学習しています。",
             }
-        return {
-            "is_real": True,
-            "badge": f"学習元: JRA実データ ({n_races:,}R)",
-            "detail": f"実際のJRA過去レース結果（{n_races:,}レース / 期間: {min_d} 〜 {max_d}）を使用して学習しています。",
-        }
-    except Exception:
-        return {
-            "is_real": False,
-            "badge": "学習元: 確認中",
-            "detail": "学習データの種別を確認できませんでした。",
-        }
+        except Exception:
+            pass
+
+    if _artifact and isinstance(_artifact, dict):
+        jockeys = [str(j) for j in _artifact.get("category_maps", {}).get("jockey_id", [])]
+        real_jockeys = [
+            j for j in jockeys
+            if not j.startswith("JOCKEY_") and j not in ("UNKNOWN_J", "UNKNOWN", "nan", "")
+        ]
+        n_r = _artifact.get("n_races")
+        if len(real_jockeys) >= 20 or (n_r is not None and int(n_r) > 0):
+            badge_txt = f"学習元: JRA実データ ({int(n_r):,}R)" if n_r else "学習元: JRA実データモデル適用中"
+            detail_txt = (
+                f"実際のJRA過去レース結果（{int(n_r):,}レース）で学習済みのモデル（models/keiba_lgbm.pkl）を使用して予測しています。"
+                if n_r
+                else "実際のJRA過去レース結果で学習済みのモデル（models/keiba_lgbm.pkl）を使用して予測しています。"
+            )
+            return {
+                "is_real": True,
+                "badge": badge_txt,
+                "detail": detail_txt,
+            }
+
+    return {
+        "is_real": False,
+        "badge": "学習データ未確認",
+        "detail": "models/keiba_lgbm.pkl または data/historical_races.csv を確認してください。",
+    }
 
 
 def load_race_into_session(race_item: dict, date_str: str):
@@ -539,11 +558,13 @@ def load_race_into_session(race_item: dict, date_str: str):
     )
 
 
-artifact = load_artifact()
+model_path = "models/keiba_lgbm.pkl"
+model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else 0.0
+artifact = load_artifact(model_mtime)
 model = artifact["model"]
 feature_cols = artifact["feature_cols"]
 category_maps = artifact["category_maps"]
-train_status = get_training_data_status()
+train_status = get_training_data_status(artifact, model_mtime)
 
 # ==============================================================================
 # サイドバー：開催日＆レース取得・設定
@@ -678,6 +699,19 @@ budget_modes = build_budget_mode_tickets(
     style_mode=selected_style_mode,
 )
 
+# 200円モード（期待値×的中率バランス最上位の厳選2点）を生成
+df_300_src = budget_modes["mode_300"]["tickets_df"]
+df_200_tickets = df_300_src.head(2).copy().reset_index(drop=True)
+if not df_200_tickets.empty and "購入額(円)" in df_200_tickets.columns:
+    df_200_tickets["購入額(円)"] = 100
+    cost_200 = int(df_200_tickets["購入額(円)"].sum())
+else:
+    cost_200 = len(df_200_tickets) * 100
+budget_modes["mode_200"] = {
+    "tickets_df": df_200_tickets,
+    "total_cost": cost_200,
+}
+
 trio_strategies = build_trio_strategies(
     trio_df=trio_df,
     horses_df=race_df,
@@ -753,8 +787,9 @@ navbar_html = f"""
 """
 st.markdown(navbar_html.strip(), unsafe_allow_html=True)
 
-tab_main, tab_stats, tab_help = st.tabs([
+tab_main, tab_win5, tab_stats, tab_help = st.tabs([
     "レース予想・買い目",
+    "WIN5 期待値予想",
     "戦績・回収率",
     "ヘルプ・算出ロジック解説",
 ])
@@ -794,7 +829,6 @@ with tab_main:
                 ):
                     st.session_state["selected_venue"] = v_name
                     v_races = [r for r in fetched_list if r["venue"] == v_name]
-                    # 同じR番号があれば維持、なければ11Rまたは先頭レースへ切替
                     target_r = next(
                         (r for r in v_races if r["race_num"] == race_num_int),
                         next((r for r in v_races if r["race_num"] == 11), v_races[0]),
@@ -869,7 +903,6 @@ with tab_main:
                         except Exception as e:
                             st.error(f"取得エラー: {e}")
     else:
-        # まだ開催一覧を取得していない場合でもワンタップで当日レース一覧を呼べるボタンを表示
         st.markdown('<div class="venue-nav-zone"></div>', unsafe_allow_html=True)
         q_c1, q_c2 = st.columns([2, 3])
         with q_c1:
@@ -959,7 +992,7 @@ with tab_main:
         return "".join(chips)
 
     # ==========================================================================
-    # 買い目モード選択パネル
+    # 買い目モード選択パネル（200円 / 300円 / 500円 / 2000円）
     # ==========================================================================
     st.markdown("### 買い目モード選択")
 
@@ -969,7 +1002,17 @@ with tab_main:
     current_mode = st.session_state["selected_budget_mode"]
 
     st.markdown('<div class="mode-btn-zone"></div>', unsafe_allow_html=True)
-    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    btn_col0, btn_col1, btn_col2, btn_col3 = st.columns(4)
+    with btn_col0:
+        if st.button(
+            "200円",
+            key="btn_mode_200",
+            type="primary" if current_mode == "200" else "secondary",
+            width="stretch",
+        ):
+            st.session_state["selected_budget_mode"] = "200"
+            st.rerun()
+
     with btn_col1:
         if st.button(
             "300円",
@@ -1002,7 +1045,28 @@ with tab_main:
 
     current_mode = st.session_state["selected_budget_mode"]
 
-    if current_mode == "500":
+    if current_mode == "200":
+        m200 = budget_modes["mode_200"]
+        df_200 = m200["tickets_df"]
+        card_200 = f"""
+    <div class="bet-card">
+      <div class="bet-card-title">200円モード：期待値(EV)と的中率バランス超厳選2点（計 {len(df_200)}点 × 100円 ＝ {m200['total_cost']}円）</div>
+      <div style="font-size:0.86rem; color:#475569;">現在の狙い方スタイル（{html.escape(style_short_badge)}）に基づき、全券種から最優先の2点だけを厳選抽出しています。</div>
+    </div>
+    """
+        st.markdown(card_200.strip(), unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("合計購入金額", f"{m200['total_cost']} 円（{len(df_200)}点）")
+        c2.metric("平均期待値(EV)", f"{df_200['期待値(EV)'].mean():.2f}" if not df_200.empty else "-")
+        c3.metric("最大想定払戻", f"{df_200['想定払戻(円)'].max():,} 円" if not df_200.empty else "-")
+        st.dataframe(
+            df_200[["券種", "組み合わせ", "対象馬名", "オッズ", "的中率(%)", "期待値(EV)", "購入額(円)", "想定払戻(円)"]]
+            .style.format({"オッズ": "{:.1f}", "的中率(%)": "{:.2f}%", "期待値(EV)": "{:.2f}"}),
+            width="stretch",
+            hide_index=True,
+        )
+
+    elif current_mode == "500":
         m500 = budget_modes["mode_500"]
         df_500 = m500["tickets_df"]
         card_500 = f"""
@@ -1091,10 +1155,24 @@ with tab_main:
             )
 
     # ==========================================================================
-    # 買い目保存 ＆ 即PAT連携アクションバー
+    # 買い目保存 ＆ 即PAT連携アクションバー（200円モード完全対応）
     # ==========================================================================
-    active_ticket_rows = bet_tracker.extract_mode_ticket_rows(current_mode, budget_modes)
-    ipat_data = bet_tracker.build_ipat_exports(race_meta, current_mode, budget_modes, active_ticket_rows)
+    if current_mode == "200":
+        proxy_modes = dict(budget_modes)
+        proxy_modes["mode_300"] = budget_modes["mode_200"]
+        active_ticket_rows = bet_tracker.extract_mode_ticket_rows("300", proxy_modes)
+        for row_item in active_ticket_rows:
+            if isinstance(row_item, dict) and "mode" in row_item:
+                row_item["mode"] = "200円"
+        ipat_data = bet_tracker.build_ipat_exports(race_meta, "300", proxy_modes, active_ticket_rows)
+        ipat_data = {
+            "human_text": str(ipat_data.get("human_text", "")).replace("300円", "200円"),
+            "ipat_csv": str(ipat_data.get("ipat_csv", "")),
+            "filename": str(ipat_data.get("filename", "ipat_200.csv")).replace("300", "200"),
+        }
+    else:
+        active_ticket_rows = bet_tracker.extract_mode_ticket_rows(current_mode, budget_modes)
+        ipat_data = bet_tracker.build_ipat_exports(race_meta, current_mode, budget_modes, active_ticket_rows)
 
     act_c1, act_c2, act_c3 = st.columns(3)
     with act_c1:
@@ -1289,7 +1367,23 @@ with tab_main:
             st.info("フォーメーションを構築できる候補が不足しています。")
 
 # ==============================================================================
-# タブ2：戦績・回収率ダッシュボード
+# タブ2：WIN5 期待値予想ツール
+# ==============================================================================
+with tab_win5:
+    win5_engine.render_win5_tab(
+        model=model,
+        feature_cols=feature_cols,
+        category_maps=category_maps,
+        train_model=train_model,
+        shutuba_scraper=shutuba_scraper,
+        ai_weight=ai_weight,
+        selected_style_mode=selected_style_mode,
+        exclude_fav1=exclude_fav1,
+        style_short_badge=style_short_badge,
+    )
+
+# ==============================================================================
+# タブ3：戦績・回収率ダッシュボード
 # ==============================================================================
 with tab_stats:
     st.markdown("### 予想買い目の戦績・回収率管理")
@@ -1320,7 +1414,7 @@ with tab_stats:
 
     if hist_df.empty:
         st.info(
-            "保存されている買い目がまだありません。「レース予想・買い目」タブで300円 / 500円 / 2000円モードを選び、「この買い目を履歴に保存」を押すとここに蓄積されます。"
+            "保存されている買い目がまだありません。「レース予想・買い目」タブで200円 / 300円 / 500円 / 2000円モードを選び、「この買い目を履歴に保存」を押すとここに蓄積されます。"
         )
     else:
         settled_df = hist_df[hist_df["status"].isin(["的中", "不的中"])].copy()
@@ -1367,7 +1461,7 @@ with tab_stats:
 
             col_s1, col_s2 = st.columns(2)
             with col_s1:
-                st.markdown("#### モード別 回収率（300円 / 500円 / 2000円）")
+                st.markdown("#### モード別 回収率（200円 / 300円 / 500円 / 2000円）")
                 mode_summary = summarize_by_col(settled_df, "mode", "モード")
                 st.dataframe(
                     mode_summary.style.format({
@@ -1429,7 +1523,7 @@ with tab_stats:
         with f_col1:
             filter_status = st.multiselect("ステータスで絞り込み", ["未確定", "的中", "不的中"], default=["未確定", "的中", "不的中"])
         with f_col2:
-            filter_mode = st.multiselect("モードで絞り込み", ["300円", "500円", "2000円"], default=["300円", "500円", "2000円"])
+            filter_mode = st.multiselect("モードで絞り込み", ["200円", "300円", "500円", "2000円"], default=["200円", "300円", "500円", "2000円"])
 
         view_df = hist_df[hist_df["status"].isin(filter_status) & hist_df["mode"].isin(filter_mode)].copy()
         view_df["combination"] = view_df["combination"].str.replace(">", "→", regex=False)
@@ -1476,7 +1570,7 @@ with tab_stats:
                 st.rerun()
 
 # ==============================================================================
-# タブ3：ヘルプ・算出ロジック解説画面
+# タブ4：ヘルプ・算出ロジック解説画面
 # ==============================================================================
 with tab_help:
     help_html_1 = f"""
@@ -1486,8 +1580,8 @@ with tab_help:
   <p style="color:#475569; margin-bottom:10px;">{html.escape(train_status['detail'])}</p>
   <div class="formula-box">
     JRA実データ5年分を収集して再学習するコマンド手順:<br>
-    1. python 05_scrape_history.py --start-date 2022-01-01 --end-date 2026-11-24 --min-race-num 1<br>
-    2. python 02_train_model.py
+1. python 05_scrape_history.py --start-date 2022-01-01 --end-date 2026-11-24 --min-race-num 1<br>
+2. python 02_train_model.py
   </div>
 </div>
 
