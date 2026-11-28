@@ -583,10 +583,8 @@ pair_odds_df = st.session_state.get("auto_pair_odds_df")
 exacta_odds_df = st.session_state.get("auto_exacta_odds_df")
 trio_odds_df = st.session_state.get("auto_trio_odds_df")
 
-# 1. 単勝予測確率の算出
-feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
-raw_probs = model.predict_proba(feat_df[feature_cols])[:, 1]
-ai_pure_prob = raw_probs / raw_probs.sum()
+# 1. 単勝予測確率の算出（キャリブレーション補正済み）
+ai_pure_prob = train_model.predict_calibrated_win_probs(race_df, artifact)
 
 mkt_raw = 0.80 / np.clip(race_df["win_odds"].to_numpy(dtype=float), 1.1, 500.0)
 mkt_prob = mkt_raw / mkt_raw.sum()
