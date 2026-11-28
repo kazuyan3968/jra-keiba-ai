@@ -51,6 +51,14 @@ def _norm_name(s: str) -> str:
     return re.sub(r"\s+", "", str(s or "")).strip()
 
 
+def _norm_jockey_key(s: str) -> str:
+    """騎手名の表記揺れ（L トーレス / トーレス、Cルメール / ルメール、▲減量記号など）を吸収して比較用キーを返す"""
+    t = re.sub(r"\s+", "", str(s or "")).strip()
+    t = re.sub(r"^[▲△☆◇★]+", "", t)
+    t = re.sub(r"^[A-Za-zＡ-Ｚ．.]+", "", t)
+    return t
+
+
 def _short_date(d_str: str, ref_year: str = "") -> str:
     s = str(d_str or "").strip().replace(".", "/")
     m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
@@ -80,6 +88,21 @@ def _clean_venue(v_str: str) -> str:
         return m.group(1)
     s2 = re.sub(r"\d+", "", s).strip()
     return s2[:4] if s2 else "-"
+
+
+def _season_label(date_str: str) -> str:
+    s = str(date_str or "").strip().replace(".", "/")
+    m = re.match(r"^\d{4}/(\d{1,2})/\d{1,2}$", s)
+    if not m:
+        return ""
+    mo = int(m.group(1))
+    if mo in (3, 4, 5):
+        return "春(3〜5月)"
+    if mo in (6, 7, 8):
+        return "夏(6〜8月)"
+    if mo in (9, 10, 11):
+        return "秋(9〜11月)"
+    return "冬(12〜2月)"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -134,8 +157,8 @@ def _fetch_race_horse_meta(race_id: str) -> dict:
     return meta_by_num
 
 
-def _parse_db_results_table(soup: BeautifulSoup) -> list[dict]:
-    """db.netkeiba.com の table.db_h_race_results から過去走一覧を列名ベースで抽出する"""
+def _parse_db_results_table(soup: BeautifulSoup, max_runs: int = 40) -> list[dict]:
+    """db.netkeiba.com の table.db_h_race_results から全過去走（最大max_runs走）を列名ベースで抽出する"""
     tbl = soup.select_one("table.db_h_race_results")
     if not tbl:
         return []
@@ -197,7 +220,7 @@ def _parse_db_results_table(soup: BeautifulSoup) -> list[dict]:
             "weight": wt_raw or "-",
             "rival": rival_raw or "-",
         })
-        if len(runs) >= 5:
+        if len(runs) >= max_runs:
             break
     return runs
 
@@ -205,7 +228,6 @@ def _parse_db_results_table(soup: BeautifulSoup) -> list[dict]:
 def _parse_shutuba_past_for_horse(race_id: str, horse_num: int, horse_name: str) -> dict:
     """
     race.netkeiba.com/race/shutuba_past.html から対象馬の過去5走と基本情報を抽出するフォールバック。
-    td.Waku に依存せず、馬名一致・複数列候補から確実に該当行を特定する。
     """
     out = {"horse_id": "", "sire": "", "bms": "", "sex_age": "", "runs": []}
     url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
@@ -317,6 +339,8 @@ def _parse_shutuba_past_for_horse(race_id: str, horse_num: int, horse_name: str)
             agari_val = m_agari.group(1) if m_agari else "-"
             m_wt = re.search(r"(\d{3}\([+-]?\d+\)|\d{3})", d06_txt)
             wt_val = m_wt.group(1) if m_wt else "-"
+            m_pass = re.search(r"^([\d-]+)", d06_txt)
+            pass_val = m_pass.group(1) if m_pass else "-"
 
             d07_txt = re.sub(r"\s+", " ", d07.get_text(" ", strip=True)) if d07 else ""
             m_diff = re.search(r"\(([+-]?\d+\.\d)\)", d07_txt)
@@ -333,7 +357,7 @@ def _parse_shutuba_past_for_horse(race_id: str, horse_num: int, horse_name: str)
                 "popularity": pop_val,
                 "time": time_val,
                 "diff": diff_val,
-                "passing": "-",
+                "passing": pass_val,
                 "agari": agari_val,
                 "jockey": jockey_val,
                 "kinryo": "-",
@@ -350,7 +374,7 @@ def _parse_shutuba_past_for_horse(race_id: str, horse_num: int, horse_name: str)
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str) -> dict:
     """
-    4段フォールバックで確実に個別馬の基本プロフィール（性齢・厩舎・血統・通算成績）と過去5走詳細を取得する。
+    4段フォールバックで個別馬の基本プロフィール（性齢・厩舎・血統・通算成績）と全戦績を取得する。
     """
     info = {
         "horse_id": "",
@@ -363,7 +387,6 @@ def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str)
         "runs": [],
     }
 
-    # 1. shutuba.html メタ情報
     meta_map = _fetch_race_horse_meta(race_id)
     h_meta = meta_map.get(int(horse_num), {})
     if not h_meta and horse_name:
@@ -391,7 +414,6 @@ def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str)
         info["horse_url"] = f"https://db.netkeiba.com/horse/{horse_id}/"
         db_headers = {**HEADERS, "Referer": "https://db.netkeiba.com/"}
 
-        # 2. db.netkeiba.com/horse/{horse_id}/
         try:
             resp = requests.get(info["horse_url"], headers=db_headers, timeout=12)
             if resp.status_code == 200:
@@ -432,13 +454,12 @@ def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str)
                             a_bms = tds2[1].find("a")
                             info["bms"] = a_bms.get_text(strip=True) if a_bms else tds2[1].get_text(" ", strip=True).split()[0]
 
-                db_runs = _parse_db_results_table(soup)
+                db_runs = _parse_db_results_table(soup, max_runs=40)
                 if db_runs:
                     info["runs"] = db_runs
         except Exception:
             pass
 
-        # 3. AJAX / result サブページからの戦績取得
         if not info["runs"]:
             ajax_headers = {
                 **db_headers,
@@ -454,18 +475,17 @@ def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str)
                     if resp_s.status_code != 200:
                         continue
                     soup_s = _make_soup(_decode_html(resp_s))
-                    sub_runs = _parse_db_results_table(soup_s)
+                    sub_runs = _parse_db_results_table(soup_s, max_runs=40)
                     if sub_runs:
                         info["runs"] = sub_runs
                         break
                 except Exception:
                     continue
 
-    # 4. 最終フォールバック: shutuba_past.html
-    if not info["runs"]:
+    if not info["runs"] or not info["sire"]:
         if past_fb is None:
             past_fb = _parse_shutuba_past_for_horse(race_id, horse_num, horse_name)
-        if past_fb.get("runs"):
+        if not info["runs"] and past_fb.get("runs"):
             info["runs"] = past_fb["runs"]
         if not info["sire"] and past_fb.get("sire"):
             info["sire"] = past_fb["sire"]
@@ -473,6 +493,177 @@ def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str)
             info["bms"] = past_fb["bms"]
 
     return info
+
+
+def summarize_horse_tendencies(
+    all_runs: list[dict],
+    target_venue: str,
+    target_surface: str,
+    target_distance: int,
+    target_date: str,
+    target_cond: str,
+) -> dict:
+    """
+    取得した全戦績からコース適性・距離適性・季節傾向・馬場状態・脚質傾向を自動分析し、
+    一目でわかる概要テキストと適性バッジを生成する。
+    """
+    valid = []
+    for r in all_runs:
+        rk_s = str(r.get("rank", "")).strip()
+        if not rk_s.isdigit():
+            continue
+        valid.append({
+            "date": str(r.get("date_full", "")),
+            "venue": str(r.get("venue", "")),
+            "distance": str(r.get("distance", "")),
+            "condition": str(r.get("condition", "")),
+            "rank": int(rk_s),
+            "passing": str(r.get("passing", "")),
+            "agari": str(r.get("agari", "")),
+        })
+
+    if not valid:
+        return {
+            "headline": "戦績データが少ないため、近走の着順・騎手気配・調教を中心にご確認ください。",
+            "bullets": [],
+            "badges": [],
+        }
+
+    def _stats(sub: list[dict]) -> tuple[int, int, int, int, float]:
+        n = len(sub)
+        w = sum(1 for x in sub if x["rank"] == 1)
+        s = sum(1 for x in sub if x["rank"] == 2)
+        t = sum(1 for x in sub if x["rank"] == 3)
+        p_rate = (w + s + t) / n if n > 0 else 0.0
+        return w, s, t, n - (w + s + t), p_rate
+
+    bullets = []
+    badges = []
+    headline_parts = []
+
+    # 1. 競馬場（コース）適性
+    by_venue: dict[str, list[dict]] = {}
+    for x in valid:
+        v = x["venue"]
+        if v and v != "-":
+            by_venue.setdefault(v, []).append(x)
+
+    cur_v_runs = by_venue.get(target_venue, [])
+    if cur_v_runs:
+        w, s, t, o, pr = _stats(cur_v_runs)
+        rec = f"[{w}-{s}-{t}-{o}]"
+        if pr >= 0.50 and len(cur_v_runs) >= 2:
+            headline_parts.append(f"{target_venue}コース巧者{rec}")
+            bullets.append(f"舞台適性：今回の{target_venue}コースは {rec}（複勝率{int(round(pr * 100))}%）と好相性です。")
+            badges.append((f"{target_venue}得意 {rec}", "#047857", "#ecfdf5"))
+        elif (w + s + t) == 0 and len(cur_v_runs) >= 3:
+            bullets.append(f"舞台適性：今回の{target_venue}コースは {rec} とやや苦戦傾向です。")
+            badges.append((f"{target_venue}苦戦 {rec}", "#b45309", "#fffbeb"))
+        else:
+            bullets.append(f"舞台適性：今回の{target_venue}コースは {rec}。")
+    else:
+        bullets.append(f"舞台適性：{target_venue}コースは今回が初出走です。")
+
+    best_v = None
+    best_v_score = (-1.0, 0)
+    for v, sub in by_venue.items():
+        if len(sub) < 2:
+            continue
+        w, s, t, o, pr = _stats(sub)
+        if pr >= 0.50 and (pr, len(sub)) > best_v_score:
+            best_v_score = (pr, len(sub))
+            best_v = (v, w, s, t, o, pr)
+    if best_v and best_v[0] != target_venue:
+        v, w, s, t, o, pr = best_v
+        bullets.append(f"得意コース：{v}コースで [{w}-{s}-{t}-{o}]（複勝率{int(round(pr * 100))}%）と良績を残しています。")
+        if not headline_parts:
+            headline_parts.append(f"{v}コース好走歴あり[{w}-{s}-{t}-{o}]")
+
+    # 2. 距離・トラック適性
+    surf_short = "ダ" if "ダ" in str(target_surface) else "芝"
+    near_dist_runs = []
+    for x in valid:
+        m = re.search(r"([芝ダ障])(\d{3,4})", x["distance"])
+        if m and m.group(1) == surf_short and abs(int(m.group(2)) - int(target_distance)) <= 200:
+            near_dist_runs.append(x)
+    if near_dist_runs:
+        w, s, t, o, pr = _stats(near_dist_runs)
+        rec = f"[{w}-{s}-{t}-{o}]"
+        if pr >= 0.50 and len(near_dist_runs) >= 2:
+            bullets.append(f"距離適性：{surf_short}{target_distance}m前後（±200m）で {rec} と安定して走れています。")
+            badges.append((f"{surf_short}{target_distance}m前後 {rec}", "#1d4ed8", "#eff6ff"))
+            if not headline_parts:
+                headline_parts.append(f"{surf_short}{target_distance}m前後で安定{rec}")
+        else:
+            bullets.append(f"距離適性：{surf_short}{target_distance}m前後（±200m）は {rec}。")
+
+    # 3. 季節・時期傾向
+    by_season: dict[str, list[dict]] = {}
+    for x in valid:
+        sea = _season_label(x["date"])
+        if sea:
+            by_season.setdefault(sea, []).append(x)
+
+    cur_sea = _season_label(target_date.replace("-", "/"))
+    best_sea = None
+    best_sea_score = (-1.0, 0)
+    for sea, sub in by_season.items():
+        if len(sub) < 2:
+            continue
+        w, s, t, o, pr = _stats(sub)
+        if pr >= 0.50 and (pr, len(sub)) > best_sea_score:
+            best_sea_score = (pr, len(sub))
+            best_sea = (sea, w, s, t, o, pr)
+
+    if best_sea:
+        sea, w, s, t, o, pr = best_sea
+        if sea == cur_sea:
+            bullets.append(f"季節傾向：今走と同じ{sea}は [{w}-{s}-{t}-{o}]（複勝率{int(round(pr * 100))}%）と好走シーズンです。")
+            headline_parts.append(f"{sea}に好走集中[{w}-{s}-{t}-{o}]")
+            badges.append((f"{sea}好調 [{w}-{s}-{t}-{o}]", "#7c3aed", "#f5f3ff"))
+        else:
+            bullets.append(f"季節傾向：{sea}に [{w}-{s}-{t}-{o}]（複勝率{int(round(pr * 100))}%）と実績が集中しています。")
+
+    # 4. 馬場状態（良 vs 道悪）
+    heavy_runs = [x for x in valid if any(k in x["condition"] for k in ("稍", "重", "不"))]
+    if len(heavy_runs) >= 2:
+        w, s, t, o, pr = _stats(heavy_runs)
+        if pr >= 0.50:
+            bullets.append(f"馬場適性：道悪（稍重〜不良）でも [{w}-{s}-{t}-{o}] とパワーを要する馬場を苦にしません。")
+            badges.append((f"道悪OK [{w}-{s}-{t}-{o}]", "#0369a1", "#f0f9ff"))
+        elif (w + s + t) == 0 and len(heavy_runs) >= 3:
+            bullets.append(f"馬場適性：道悪（稍重〜不良）は [{w}-{s}-{t}-{o}] と良馬場向きです。")
+
+    # 5. 脚質傾向（通過順から推定）
+    first_corners = []
+    for x in valid[:8]:
+        m_p = re.match(r"^(\d+)", x["passing"].strip())
+        if m_p:
+            first_corners.append(int(m_p.group(1)))
+    if len(first_corners) >= 2:
+        avg_pos = float(np.mean(first_corners))
+        if avg_pos <= 2.5:
+            style_txt = "逃げ・先行タイプ（前目で流れに乗れる脚質）"
+            badges.append(("逃げ・先行", "#dc2626", "#fef2f2"))
+        elif avg_pos <= 5.5:
+            style_txt = "好位〜中団タイプ（自在に立ち回れる脚質）"
+            badges.append(("好位・自在", "#d97706", "#fffbeb"))
+        else:
+            style_txt = "差し・追込タイプ（終いの末脚を活かす脚質）"
+            badges.append(("差し・追込", "#2563eb", "#eff6ff"))
+        bullets.append(f"脚質傾向：{style_txt}です。")
+
+    if headline_parts:
+        headline = "この馬は " + " ／ ".join(headline_parts[:2]) + " の傾向があります。"
+    else:
+        w, s, t, o, pr = _stats(valid)
+        headline = f"集計戦績 [{w}-{s}-{t}-{o}]（複勝率{int(round(pr * 100))}%）。大きな偏りは少なく条件を問わず走るタイプです。"
+
+    return {
+        "headline": headline,
+        "bullets": bullets[:5],
+        "badges": badges[:4],
+    }
 
 
 def analyze_feature_contributions(
@@ -512,6 +703,19 @@ def analyze_feature_contributions(
     hw_v = int(row_src.get("horse_weight", 476))
     wd_v = int(row_src.get("weight_diff", 0))
 
+    jockey_cols = [
+        c for c in (
+            "jockey_id", "jockey_win_rate", "jockey_place_rate",
+            "jockey_surface_win_rate", "jockey_venue_win_rate",
+            "rel_jockey_win_rate", "jockey_upgrade",
+        )
+        if c in feature_cols
+    ]
+    trainer_cols = [
+        c for c in ("trainer_id", "trainer_win_rate", "trainer_place_rate")
+        if c in feature_cols
+    ]
+
     groups = [
         {
             "name": "近3走の着順",
@@ -524,18 +728,18 @@ def analyze_feature_contributions(
             "desc": f"{td_v:.2f}秒差",
         },
         {
-            "name": "騎手実績",
-            "cols": ["jockey_id"],
+            "name": "騎手実績・適性",
+            "cols": jockey_cols,
             "desc": jk_v,
         },
         {
             "name": "厩舎力",
-            "cols": ["trainer_id"],
+            "cols": trainer_cols,
             "desc": tr_v,
         },
         {
             "name": "枠順・馬番",
-            "cols": ["frame_num", "horse_num"],
+            "cols": ["frame_num", "horse_num", "frame_ratio"],
             "desc": f"{fr_v}枠{hn_v}番",
         },
         {
@@ -676,7 +880,7 @@ def render_horse_side_panel(
 ):
     """
     出走表の右側に並ぶインライン馬詳細パネルを描画する。
-    「‹ 前の馬 | 1 / N | 次の馬 ›」「✕」「シグナル根拠」「基本」「近5走」を1カード内に表示する。
+    「‹ 前の馬 | 1 / N | 次の馬 ›」「✕」「シグナル根拠」「特徴・適性サマリー」「基本」「近5走」を表示。
     """
     ordered_df = race_df.sort_values("ai_rank", ascending=True).reset_index(drop=True)
     total_n = len(ordered_df)
@@ -689,6 +893,10 @@ def render_horse_side_panel(
     jockey_now = str(row.get("jockey_id", "-"))
     kinryo_now = float(row.get("weight_carried", 56.0))
     trainer_now = str(row.get("trainer_id", "-"))
+    venue_now = str(row.get("venue", "東京"))
+    surf_now = str(row.get("surface", "芝"))
+    dist_now = int(float(row.get("distance", 2000)))
+    cond_now = str(row.get("track_condition", "良"))
     pop_now = int(row["popularity"])
     odds_now = float(row["win_odds"])
     win_p = float(row["pred_win_pct"])
@@ -723,7 +931,7 @@ def render_horse_side_panel(
                     pass
                 st.rerun()
 
-        # 2. 前後の馬ナビゲーション（‹ 前の馬 | 1 / N | 次の馬 ›）
+        # 2. 前後の馬ナビゲーション
         nav1, nav2, nav3 = st.columns([1.6, 0.9, 1.6])
         with nav1:
             if st.button("‹ 前の馬", key="btn_panel_prev_horse", disabled=(cur_idx <= 0), width="stretch"):
@@ -747,7 +955,7 @@ def render_horse_side_panel(
                 st.session_state["selected_detail_horse"] = next_h
                 st.rerun()
 
-        # 3. バッジ行（AI順位・シグナル・信頼度・単勝EV）
+        # 3. バッジ行
         badges = [
             f'<span style="background:#dc2626; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 9px; border-radius:5px;">AI{cur_idx + 1}位</span>',
             f'<span style="background:{exp["sig_color"]}; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 10px; border-radius:5px;">{html.escape(exp["sig_label"])}</span>',
@@ -815,11 +1023,50 @@ def render_horse_side_panel(
             unsafe_allow_html=True,
         )
 
-        # 5. Webから基本プロフィール＆近5走取得
-        with st.spinner("基本データ・近5走を取得中..."):
+        # 5. Webから基本プロフィール＆全戦績取得
+        with st.spinner("基本データ・戦績傾向を取得中..."):
             prof = fetch_horse_profile_and_past5(race_id=str(race_id), horse_num=h_num, horse_name=h_name)
 
         runs = prof.get("runs", [])
+
+        # 6. 特徴・適性サマリー（コース適性・季節・馬場・脚質）
+        tendency = summarize_horse_tendencies(
+            all_runs=runs,
+            target_venue=venue_now,
+            target_surface=surf_now,
+            target_distance=dist_now,
+            target_date=date_str,
+            target_cond=cond_now,
+        )
+        t_head_esc = html.escape(tendency["headline"])
+        t_badges_html = "".join(
+            f'<span style="background:{bg_c}; color:{fg_c}; border:1px solid {fg_c}33; '
+            f'font-size:0.72rem; font-weight:800; padding:2px 8px; border-radius:999px;">{html.escape(lbl)}</span>'
+            for lbl, fg_c, bg_c in tendency["badges"]
+        )
+        t_bullets_html = "".join(
+            f'<li style="margin-bottom:2px;">{html.escape(b)}</li>'
+            for b in tendency["bullets"]
+        )
+        badges_row_div = (
+            f'<div style="display:flex; gap:5px; flex-wrap:wrap; margin:5px 0 6px 0;">{t_badges_html}</div>'
+            if t_badges_html else ""
+        )
+        bullets_ul = (
+            f'<ul style="margin:4px 0 0 0; padding-left:17px; font-size:0.77rem; color:#334155; line-height:1.45;">{t_bullets_html}</ul>'
+            if t_bullets_html else ""
+        )
+        st.markdown(
+            '<div style="font-size:0.84rem; font-weight:800; color:#192442; border-left:3.5px solid #047857; padding-left:7px; margin:6px 0 6px 0;">特徴・適性サマリー</div>'
+            '<div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:7px; padding:9px 11px; margin-bottom:12px;">'
+            f'<div style="font-size:0.82rem; font-weight:800; color:#0f172a; line-height:1.45;">{t_head_esc}</div>'
+            f'{badges_row_div}'
+            f'{bullets_ul}'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # 7. 基本プロフィール
         sex_age = prof.get("sex_age") or "-"
         trainer_disp = prof.get("trainer") or trainer_now
         sire = prof.get("sire") or ""
@@ -843,14 +1090,14 @@ def render_horse_side_panel(
 
             prev_jk = str(r0.get("jockey", "") or "").strip()
             if prev_jk and prev_jk != "-":
-                if _norm_name(prev_jk)[:2] == _norm_name(jockey_now)[:2]:
+                if _norm_jockey_key(prev_jk) == _norm_jockey_key(jockey_now):
                     jk_disp = f"○ 継続騎乗（{jockey_now}）"
                 else:
                     jk_disp = f"△ 乗り替わり（前走 {prev_jk}）"
             else:
                 jk_disp = jockey_now
 
-            num_ranks = [int(r["rank"]) for r in runs if str(r.get("rank", "")).isdigit()]
+            num_ranks = [int(r["rank"]) for r in runs[:5] if str(r.get("rank", "")).isdigit()]
             if num_ranks:
                 w_cnt = sum(1 for x in num_ranks if x == 1)
                 p_cnt = sum(1 for x in num_ranks if x <= 3)
@@ -868,7 +1115,6 @@ def render_horse_side_panel(
 
         career_disp = prof.get("career") or "-"
 
-        # 基本セクション
         basic_rows = [
             ("性齢", sex_age),
             ("厩舎", trainer_disp),
@@ -892,7 +1138,7 @@ def render_horse_side_panel(
             unsafe_allow_html=True,
         )
 
-        # 近5走セクション
+        # 8. 近5走セクション
         st.markdown(
             '<div style="font-size:0.84rem; font-weight:800; color:#192442; border-left:3.5px solid #2563eb; padding-left:7px; margin:8px 0 6px 0;">近5走</div>',
             unsafe_allow_html=True,
