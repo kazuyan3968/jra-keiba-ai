@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 import importlib
 from importlib.util import module_from_spec, spec_from_file_location
 import html
@@ -40,7 +40,7 @@ spec_tracker.loader.exec_module(bet_tracker)
 st.set_page_config(page_title="KAZUYAN AI | 期待値＆買い目シミュレーター", layout="wide")
 
 # ==============================================================================
-# カスタムCSS（開催馬場ピルボタン・前R/次Rボタン・買い目タイル・出走表）
+# カスタムCSS（開催馬場ピルボタン・前R/次Rボタン・買い目タイル・出走表・右パネル）
 # ==============================================================================
 st.markdown(
     """
@@ -51,7 +51,7 @@ st.markdown(
 .block-container {
     padding-top: 3.8rem !important;
     padding-bottom: 2.5rem;
-    max-width: 1320px;
+    max-width: 1420px;
 }
 div[data-testid="stDeployButton"] {
     display: none;
@@ -106,7 +106,7 @@ div[data-testid="stDeployButton"] {
     font-weight: 700;
 }
 
-/* 開催馬場＆レース移動ピルボタン（写真スタイル準拠） */
+/* 開催馬場＆レース移動ピルボタン */
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button,
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
     min-height: 40px !important;
@@ -276,15 +276,15 @@ div[data-testid="stDeployButton"] {
 .shutuba-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.9rem;
+    font-size: 0.88rem;
     text-align: center;
 }
 .shutuba-table thead th {
     background-color: #192442;
     color: #ffffff;
     font-weight: 600;
-    padding: 10px 8px;
-    font-size: 0.8rem;
+    padding: 9px 6px;
+    font-size: 0.78rem;
     white-space: nowrap;
     border-bottom: 2px solid #0f172a;
 }
@@ -298,8 +298,12 @@ div[data-testid="stDeployButton"] {
 .row-rank-1 { background-color: #fdf2f2; }
 .row-rank-2 { background-color: #fff8eb; }
 .row-rank-3 { background-color: #f8fafc; }
+.row-selected {
+    background-color: #eff6ff !important;
+    box-shadow: inset 4px 0 0 #2563eb;
+}
 .shutuba-table td {
-    padding: 9px 8px;
+    padding: 8px 6px;
     vertical-align: middle;
 }
 
@@ -308,11 +312,11 @@ div[data-testid="stDeployButton"] {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     border-radius: 50%;
     font-weight: 800;
-    font-size: 0.85rem;
+    font-size: 0.82rem;
     box-shadow: 0 1px 2px rgba(0,0,0,0.18);
 }
 .waku-1 { background: #ffffff; color: #111827; border: 1.5px solid #9ca3af; }
@@ -325,17 +329,17 @@ div[data-testid="stDeployButton"] {
 .waku-8 { background: #ec4899; color: #ffffff; }
 
 /* 馬番＆印 */
-.umaban-txt { font-weight: 800; font-size: 1.02rem; }
+.umaban-txt { font-weight: 800; font-size: 1.0rem; }
 .umaban-top { color: #dc2626; }
-.mark-badge { font-weight: 900; font-size: 1.05rem; color: #dc2626; }
+.mark-badge { font-weight: 900; font-size: 1.02rem; color: #dc2626; }
 
 /* オッズ＆人気2段 */
-.pop-tag { font-size: 0.72rem; color: #2563eb; font-weight: 600; line-height: 1.1; }
-.odds-val { font-size: 1.02rem; font-weight: 800; color: #111827; line-height: 1.2; }
+.pop-tag { font-size: 0.70rem; color: #2563eb; font-weight: 600; line-height: 1.1; }
+.odds-val { font-size: 0.98rem; font-weight: 800; color: #111827; line-height: 1.2; }
 
-/* 馬名＆騎手2段（馬名リンク） */
-.horse-cell { text-align: left !important; padding-left: 12px !important; }
-.horse-title { font-weight: 800; font-size: 0.96rem; color: #1d4ed8; line-height: 1.25; }
+/* 馬名＆騎手2段（インライン選択リンク） */
+.horse-cell { text-align: left !important; padding-left: 10px !important; white-space: nowrap; }
+.horse-title { font-weight: 800; font-size: 0.93rem; color: #1d4ed8; line-height: 1.25; }
 .horse-link {
     color: #1d4ed8 !important;
     text-decoration: none !important;
@@ -345,59 +349,63 @@ div[data-testid="stDeployButton"] {
     text-decoration: underline !important;
     color: #1e40af !important;
 }
-.jockey-sub { font-size: 0.76rem; color: #64748b; margin-top: 2px; }
+.jockey-sub { font-size: 0.74rem; color: #64748b; margin-top: 2px; }
 
 /* シグナルバッジ */
 .sig-axis {
     background-color: #dc2626;
     color: #ffffff;
     font-weight: 800;
-    font-size: 0.76rem;
-    padding: 3px 12px;
+    font-size: 0.74rem;
+    padding: 3px 10px;
     border-radius: 5px;
     display: inline-block;
+    white-space: nowrap;
 }
 .sig-value {
     background-color: #fff7ed;
     color: #c2410c;
     border: 1px solid #f97316;
     font-weight: 800;
-    font-size: 0.76rem;
-    padding: 2px 10px;
+    font-size: 0.74rem;
+    padding: 2px 8px;
     border-radius: 5px;
     display: inline-block;
+    white-space: nowrap;
 }
 .sig-himo {
     background-color: #ffffff;
     color: #2563eb;
     border: 1px solid #93c5fd;
     font-weight: 700;
-    font-size: 0.76rem;
-    padding: 2px 10px;
+    font-size: 0.74rem;
+    padding: 2px 8px;
     border-radius: 5px;
     display: inline-block;
+    white-space: nowrap;
 }
 .sig-wait {
     background-color: #f8fafc;
     color: #64748b;
     border: 1px solid #cbd5e1;
     font-weight: 600;
-    font-size: 0.76rem;
-    padding: 2px 10px;
+    font-size: 0.74rem;
+    padding: 2px 8px;
     border-radius: 5px;
     display: inline-block;
+    white-space: nowrap;
 }
 
 /* 信頼度ランク */
-.conf-s { color: #dc2626; font-weight: 900; font-size: 1.05rem; }
-.conf-a { color: #dc2626; font-weight: 800; font-size: 1.0rem; }
-.conf-b { color: #d97706; font-weight: 800; font-size: 0.95rem; }
+.conf-s { color: #dc2626; font-weight: 900; font-size: 1.02rem; }
+.conf-a { color: #dc2626; font-weight: 800; font-size: 0.98rem; }
+.conf-b { color: #d97706; font-weight: 800; font-size: 0.92rem; }
 .conf-none { color: #94a3b8; font-weight: 600; }
 
 /* 能力値＆プログレスバー */
-.ability-wrap { display: inline-flex; align-items: center; gap: 8px; justify-content: center; }
-.ability-num { font-weight: 800; font-size: 0.92rem; min-width: 36px; text-align: right; }
-.bar-bg { width: 58px; height: 8px; background-color: #e2e8f0; border-radius: 4px; overflow: hidden; }
+.ability-wrap { display: inline-flex; align-items: center; gap: 6px; justify-content: center; }
+.ability-num { font-weight: 800; font-size: 0.88rem; min-width: 34px; text-align: right; }
+.bar-bg { width: 48px; height: 7px; background-color: #e2e8f0; border-radius: 4px; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 4px; }
 
 /* 確率カラム */
@@ -497,6 +505,16 @@ def load_artifact(model_mtime: float):
     return joblib.load("models/keiba_lgbm.pkl")
 
 
+@st.cache_data(ttl=180, show_spinner=False)
+def _cached_fetch_race_list(date_str: str) -> list[dict]:
+    return shutuba_scraper.fetch_race_list_by_date(date_str)
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _cached_fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
+    return shutuba_scraper.fetch_shutuba_and_odds(race_id=race_id, date_str=date_str)
+
+
 @st.cache_data(ttl=30)
 def get_training_data_status(_artifact: dict | None = None, model_mtime: float = 0.0) -> dict:
     hist_path = "data/historical_races.csv"
@@ -548,13 +566,25 @@ def get_training_data_status(_artifact: dict | None = None, model_mtime: float =
     }
 
 
-def load_race_into_session(race_item: dict, date_str: str):
-    """指定されたレースアイテム（race_id, venue, race_num）の出馬表と全オッズを取得してセッションに反映"""
-    bundle = shutuba_scraper.fetch_shutuba_and_odds(
-        race_id=race_item["race_id"],
-        date_str=date_str,
-    )
-    scraped_df = bundle["shutuba_df"]
+def load_race_into_session(
+    race_item: dict,
+    date_str: str,
+    force_refresh: bool = False,
+    keep_detail_horse: bool = False,
+):
+    """指定されたレースの出馬表と全オッズを取得してセッションに反映"""
+    if force_refresh:
+        _cached_fetch_shutuba_and_odds.clear()
+        bundle = shutuba_scraper.fetch_shutuba_and_odds(
+            race_id=race_item["race_id"],
+            date_str=date_str,
+        )
+    else:
+        bundle = _cached_fetch_shutuba_and_odds(
+            race_id=race_item["race_id"],
+            date_str=date_str,
+        )
+    scraped_df = bundle["shutuba_df"].copy()
     os.makedirs("data", exist_ok=True)
     scraped_df.to_csv("data/upcoming_race.csv", index=False)
 
@@ -569,20 +599,10 @@ def load_race_into_session(race_item: dict, date_str: str):
         if bundle["has_real_multi"]
         else ("単勝実オッズ取得済" if bundle["has_real_win"] else "発売前仮オッズ")
     )
+    if not keep_detail_horse:
+        st.session_state["selected_detail_horse"] = None
 
 
-model_path = "models/keiba_lgbm.pkl"
-model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else 0.0
-artifact = load_artifact(model_mtime)
-model = artifact["model"]
-feature_cols = artifact["feature_cols"]
-category_maps = artifact["category_maps"]
-train_status = get_training_data_status(artifact, model_mtime)
-
-
-# ==============================================================================
-# 馬名クリックで開かれた別タブ（個別馬AI診断・過去5走レポート）のルーティング
-# ==============================================================================
 def _get_query_param(key: str, default: str = "") -> str:
     try:
         val = st.query_params.get(key, default)
@@ -593,44 +613,83 @@ def _get_query_param(key: str, default: str = "") -> str:
         return default
 
 
-if _get_query_param("view") == "horse":
+# ==============================================================================
+# 馬名クリック（同一画面インライン表示）のクエリパラメータ復元処理
+# ==============================================================================
+q_horse = _get_query_param("horse", "")
+if q_horse.isdigit():
+    st.session_state["selected_detail_horse"] = int(q_horse)
+
     q_rid = _get_query_param("race_id", "")
-    q_date = _get_query_param("date", date.today().strftime("%Y-%m-%d"))
-    q_hnum_s = _get_query_param("horse_num", "1")
-    q_aiw_s = _get_query_param("ai_w", "0.75")
-    q_ev_s = _get_query_param("ev_th", "1.15")
-    q_ex1_s = _get_query_param("ex1", "0")
+    q_date = _get_query_param("date", "")
+    q_mode = _get_query_param("mode", "")
+    q_style = _get_query_param("style", "")
+    q_aiw = _get_query_param("ai_w", "")
+    q_ev = _get_query_param("ev_th", "")
+    q_ex1 = _get_query_param("ex1", "")
 
-    try:
-        q_hnum = int(q_hnum_s)
-    except ValueError:
-        q_hnum = 1
-    try:
-        q_aiw = float(q_aiw_s)
-    except ValueError:
-        q_aiw = 0.75
-    try:
-        q_ev = float(q_ev_s)
-    except ValueError:
-        q_ev = 1.15
-    q_ex1 = (q_ex1_s == "1")
+    if q_mode in ("200", "300", "500", "2000"):
+        st.session_state["selected_budget_mode"] = q_mode
+    if q_style in ("balanced", "solid", "upset"):
+        st.session_state["_init_style_mode"] = q_style
+    if q_aiw:
+        try:
+            st.session_state["_init_ai_weight"] = float(q_aiw)
+        except ValueError:
+            pass
+    if q_ev:
+        try:
+            st.session_state["_init_ev_threshold"] = float(q_ev)
+        except ValueError:
+            pass
+    if q_ex1 in ("0", "1"):
+        st.session_state["_init_exclude_fav1"] = (q_ex1 == "1")
 
-    horse_detail_view.render_horse_detail_page(
-        race_id=q_rid,
-        date_str=q_date,
-        horse_num=q_hnum,
-        ai_weight=q_aiw,
-        ev_threshold=q_ev,
-        exclude_fav1=q_ex1,
-        model=model,
-        feature_cols=feature_cols,
-        category_maps=category_maps,
-        train_model=train_model,
-        shutuba_scraper=shutuba_scraper,
-        calculate_horse_place_probs=calculate_horse_place_probs,
-    )
-    st.stop()
+    if q_date:
+        st.session_state["fetched_race_date"] = q_date
+        if not st.session_state.get("fetched_race_list"):
+            try:
+                r_list_cached = _cached_fetch_race_list(q_date)
+                if r_list_cached:
+                    st.session_state["fetched_race_list"] = r_list_cached
+            except Exception:
+                pass
 
+    if q_rid and st.session_state.get("selected_race_id") != q_rid:
+        r_list_now = st.session_state.get("fetched_race_list", [])
+        hit_item = next((r for r in r_list_now if r["race_id"] == q_rid), None)
+        if hit_item is None:
+            v_map = {
+                "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+                "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉",
+            }
+            v_nm = v_map.get(q_rid[4:6], "東京") if len(q_rid) >= 6 else "東京"
+            r_nm = int(q_rid[-2:]) if len(q_rid) >= 2 and q_rid[-2:].isdigit() else 11
+            hit_item = {"race_id": q_rid, "venue": v_nm, "race_num": r_nm}
+        try:
+            load_race_into_session(
+                hit_item,
+                q_date or date.today().strftime("%Y-%m-%d"),
+                force_refresh=False,
+                keep_detail_horse=True,
+            )
+        except Exception:
+            pass
+
+    # 次回のボタン操作（前の馬／次の馬／閉じる）が上書きされないようURLパラメータをクリア
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+
+model_path = "models/keiba_lgbm.pkl"
+model_mtime = os.path.getmtime(model_path) if os.path.exists(model_path) else 0.0
+artifact = load_artifact(model_mtime)
+model = artifact["model"]
+feature_cols = artifact["feature_cols"]
+category_maps = artifact["category_maps"]
+train_status = get_training_data_status(artifact, model_mtime)
 
 # ==============================================================================
 # サイドバー：開催日＆レース取得・設定
@@ -641,15 +700,23 @@ data_source = st.sidebar.radio(
     ["WebからJRA出馬表・オッズを自動取得", "ローカル / CSVアップロード"],
 )
 
+default_date_val = date.today()
+if st.session_state.get("fetched_race_date"):
+    try:
+        default_date_val = datetime.strptime(st.session_state["fetched_race_date"], "%Y-%m-%d").date()
+    except Exception:
+        default_date_val = date.today()
+
 uploaded_file = None
 if data_source == "WebからJRA出馬表・オッズを自動取得":
-    target_date = st.sidebar.date_input("開催日を選択", value=date.today())
+    target_date = st.sidebar.date_input("開催日を選択", value=default_date_val)
     target_date_str = target_date.strftime("%Y-%m-%d")
 
     if st.sidebar.button("開催レース一覧を取得", width="stretch"):
         with st.spinner("開催レース一覧を取得中..."):
             try:
-                races_found = shutuba_scraper.fetch_race_list_by_date(target_date_str)
+                _cached_fetch_race_list.clear()
+                races_found = _cached_fetch_race_list(target_date_str)
                 st.session_state["fetched_race_list"] = races_found
                 st.session_state["fetched_race_date"] = target_date_str
                 if not races_found:
@@ -691,14 +758,18 @@ else:
     uploaded_file = st.sidebar.file_uploader("出馬表CSV（任意）", type=["csv"])
 
 st.sidebar.header("2. 狙い方・バランス調整")
+style_options = [
+    "標準バランス（実力軸＋妙味中穴）",
+    "堅実重視（的中率優先）",
+    "穴狙い特化（高配当EV優先）",
+]
+style_code_to_idx = {"balanced": 0, "solid": 1, "upset": 2}
+init_style_idx = style_code_to_idx.get(st.session_state.pop("_init_style_mode", "balanced"), 0)
+
 style_label = st.sidebar.radio(
     "狙い方スタイル",
-    [
-        "標準バランス（実力軸＋妙味中穴）",
-        "堅実重視（的中率優先）",
-        "穴狙い特化（高配当EV優先）",
-    ],
-    index=0,
+    style_options,
+    index=init_style_idx,
 )
 style_map = {
     "標準バランス（実力軸＋妙味中穴）": "balanced",
@@ -707,15 +778,25 @@ style_map = {
 }
 selected_style_mode = style_map[style_label]
 
+init_ai_w = float(st.session_state.pop("_init_ai_weight", 0.75))
 ai_weight = st.sidebar.slider(
     "AI独自度（低いほど実オッズの実力評価を加味）",
     min_value=0.40,
     max_value=1.00,
-    value=0.75,
+    value=float(np.clip(init_ai_w, 0.40, 1.00)),
     step=0.05,
 )
-exclude_fav1 = st.sidebar.checkbox("単勝1番人気を軸・BOXから除外", value=False)
-ev_threshold = st.sidebar.slider("期待値（EV）下限", min_value=0.80, max_value=2.50, value=1.15, step=0.05)
+init_ex1 = bool(st.session_state.pop("_init_exclude_fav1", False))
+exclude_fav1 = st.sidebar.checkbox("単勝1番人気を軸・BOXから除外", value=init_ex1)
+
+init_ev_th = float(st.session_state.pop("_init_ev_threshold", 1.15))
+ev_threshold = st.sidebar.slider(
+    "期待値（EV）下限",
+    min_value=0.80,
+    max_value=2.50,
+    value=float(np.clip(init_ev_th, 0.80, 2.50)),
+    step=0.05,
+)
 
 with st.sidebar.expander("詳細フィルタ・手動オッズCSV"):
     pair_odds_file = st.file_uploader("馬連・ワイド実オッズCSV", type=["csv"])
@@ -873,7 +954,7 @@ with tab_main:
     current_date_str = st.session_state.get("fetched_race_date", str(r_info["date"]))
 
     # ==========================================================================
-    # 写真準拠：開催馬場選択ボタンバー ＋ レース移動ボタンバー
+    # 開催馬場選択ボタンバー ＋ レース移動ボタンバー
     # ==========================================================================
     fetched_list = st.session_state.get("fetched_race_list", [])
     if fetched_list:
@@ -912,7 +993,7 @@ with tab_main:
                 if cur_item:
                     with st.spinner("最新オッズを再取得中..."):
                         try:
-                            load_race_into_session(cur_item, current_date_str)
+                            load_race_into_session(cur_item, current_date_str, force_refresh=True, keep_detail_horse=True)
                             st.rerun()
                         except Exception as e:
                             st.error(f"更新エラー: {e}")
@@ -975,7 +1056,7 @@ with tab_main:
                 today_s = date.today().strftime("%Y-%m-%d")
                 with st.spinner("開催馬場一覧を取得中..."):
                     try:
-                        races_found = shutuba_scraper.fetch_race_list_by_date(today_s)
+                        races_found = _cached_fetch_race_list(today_s)
                         st.session_state["fetched_race_list"] = races_found
                         st.session_state["fetched_race_date"] = today_s
                         if races_found:
@@ -1282,19 +1363,53 @@ with tab_main:
         st.code(ipat_data["ipat_csv"].strip(), language="text")
 
     # ==========================================================================
-    # 出走表テーブル（馬名クリックで別タブに過去5走＋シグナル判定理由を表示）
+    # 出走表 ＋ 右側インライン詳細パネル（FUJIAI風レイアウト）
     # ==========================================================================
-    st.markdown(
-        f"### 出走表 <span style='font-size:0.88rem; color:#64748b; font-weight:600;'>{len(race_df)}頭（馬名クリックで過去5走＆シグナル理由を別タブ表示）</span>",
-        unsafe_allow_html=True,
-    )
+    valid_horse_nums = set(race_df["horse_num"].astype(int).tolist())
+    sel_detail_h = st.session_state.get("selected_detail_horse")
+    if sel_detail_h is not None and int(sel_detail_h) not in valid_horse_nums:
+        sel_detail_h = None
+        st.session_state["selected_detail_horse"] = None
+
+    hdr_c1, hdr_c2 = st.columns([2.2, 1.4])
+    with hdr_c1:
+        st.markdown(
+            f"### 出走表 <span style='font-size:0.86rem; color:#64748b; font-weight:600;'>{len(race_df)}頭（馬名クリックで右側に詳細・近5走を表示）</span>",
+            unsafe_allow_html=True,
+        )
+    with hdr_c2:
+        quick_opts = ["馬詳細パネルを開く（AI順位順）"] + [
+            f"AI{int(r['ai_rank'])}位 | {int(r['horse_num']):02d} {r['horse_name']}"
+            for _, r in race_df.iterrows()
+        ]
+        quick_idx = 0
+        if sel_detail_h is not None:
+            for q_i, (_, r_q) in enumerate(race_df.iterrows(), start=1):
+                if int(r_q["horse_num"]) == int(sel_detail_h):
+                    quick_idx = q_i
+                    break
+        picked_q = st.selectbox(
+            "馬詳細クイック切替",
+            quick_opts,
+            index=quick_idx,
+            label_visibility="collapsed",
+            key=f"quick_horse_sel_{race_id_str}",
+        )
+        if picked_q != quick_opts[0]:
+            picked_num = int(picked_q.split("|")[1].strip().split()[0])
+            if picked_num != sel_detail_h:
+                st.session_state["selected_detail_horse"] = picked_num
+                st.rerun()
 
     table_rows_html = []
     for _, r in race_df.iterrows():
         ai_rank = int(r["ai_rank"])
-        row_cls = "row-rank-1" if ai_rank == 1 else ("row-rank-2" if ai_rank == 2 else ("row-rank-3" if ai_rank == 3 else ""))
         waku = int(np.clip(r["frame_num"], 1, 8))
         umaban = int(r["horse_num"])
+        is_sel_row = (sel_detail_h is not None and int(sel_detail_h) == umaban)
+
+        base_row_cls = "row-rank-1" if ai_rank == 1 else ("row-rank-2" if ai_rank == 2 else ("row-rank-3" if ai_rank == 3 else ""))
+        row_cls = f"{base_row_cls} row-selected".strip() if is_sel_row else base_row_cls
         umaban_cls = "umaban-txt umaban-top" if ai_rank <= 2 else "umaban-txt"
 
         ability = float(r["ability_score"])
@@ -1311,10 +1426,11 @@ with tab_main:
         ev_style = "color:#dc2626; font-weight:800;" if ev_val >= ev_threshold else "color:#475569; font-weight:600;"
 
         detail_qs = urlencode({
-            "view": "horse",
+            "horse": str(umaban),
             "race_id": race_id_str,
-            "date": str(r_info["date"]),
-            "horse_num": str(umaban),
+            "date": current_date_str,
+            "mode": current_mode,
+            "style": selected_style_mode,
             "ai_w": f"{ai_weight:.2f}",
             "ev_th": f"{ev_threshold:.2f}",
             "ex1": "1" if exclude_fav1 else "0",
@@ -1332,7 +1448,7 @@ with tab_main:
             f'<td><span class="{umaban_cls}">{umaban}</span></td>'
             f'<td><span class="mark-badge">{mark_esc}</span></td>'
             f'<td class="horse-cell">'
-            f'<div class="horse-title"><a class="horse-link" href="{detail_href}" target="_blank" rel="noopener noreferrer">{hname_esc}</a></div>'
+            f'<div class="horse-title"><a class="horse-link" href="{detail_href}" target="_self">{hname_esc}</a></div>'
             f'<div class="jockey-sub">{jock_esc} &nbsp; {float(r["weight_carried"]):.1f}</div></td>'
             f'<td>{r["signal_html"]}</td>'
             f'<td>{r["conf_html"]}</td>'
@@ -1351,14 +1467,33 @@ with tab_main:
         '<div class="shutuba-wrapper"><table class="shutuba-table">'
         '<thead><tr>'
         '<th>単勝オッズ ▼</th><th>AI順位 ▼</th><th>枠</th><th>馬番</th><th>印</th>'
-        '<th style="text-align:left; padding-left:12px;">馬名 / 騎手 ▼</th>'
+        '<th style="text-align:left; padding-left:10px;">馬名 / 騎手 ▼</th>'
         '<th>シグナル</th><th>信頼度</th><th>能力値 ▼</th>'
         '<th>勝率 ▼</th><th>2着内率 ▼</th><th>3着内率 ▼</th><th>単勝EV ▼</th>'
         '</tr></thead>'
         f'<tbody>{tbody_str}</tbody>'
         '</table></div>'
     )
-    st.markdown(shutuba_html, unsafe_allow_html=True)
+
+    if sel_detail_h is not None:
+        col_tbl, col_panel = st.columns([1.62, 1.0], gap="medium")
+        with col_tbl:
+            st.markdown(shutuba_html, unsafe_allow_html=True)
+        with col_panel:
+            horse_detail_view.render_horse_side_panel(
+                race_df=race_df,
+                selected_horse_num=int(sel_detail_h),
+                race_id=race_id_str,
+                date_str=str(r_info["date"]),
+                ev_threshold=ev_threshold,
+                exclude_fav1=exclude_fav1,
+                model=model,
+                feature_cols=feature_cols,
+                category_maps=category_maps,
+                train_model=train_model,
+            )
+    else:
+        st.markdown(shutuba_html, unsafe_allow_html=True)
 
     # ==========================================================================
     # 券種別 詳細データ一覧タブ
@@ -1684,11 +1819,11 @@ with tab_help:
         '</div>'
         '</div>'
         '<div class="help-card">'
-        '<h4>2. 馬名クリック詳細レポート＆ボタン操作の使い方</h4>'
+        '<h4>2. 馬詳細サイドパネル＆ボタン操作の使い方</h4>'
         '<table class="help-table">'
         '<thead><tr><th>機能・ボタン</th><th>動作内容</th></tr></thead>'
         '<tbody>'
-        '<tr><td><strong>出走表の馬名クリック</strong></td><td>別タブで個別馬の診断ページが開き、過去5走の詳細成績と「なぜ軸・穴注目・紐候補・様子見のシグナルになったのか」のAI特徴量別根拠を確認できます。</td></tr>'
+        '<tr><td><strong>出走表の馬名クリック</strong></td><td>別ウィンドウを開かず、出走表の右側に馬詳細パネルが表示されます。シグナル判定理由・AI特徴量寄与度・基本情報（性齢/厩舎/血統/間隔/通算）・近5走成績を一覧でき、「‹ 前の馬 / 次の馬 ›」で全頭を素早く確認できます。</td></tr>'
         '<tr><td><strong>開催馬場ボタン（東京・京都 等）</strong></td><td>開催日のレース一覧を取得すると、当日の開催場が丸角ボタンで並びます。タップするだけで別会場の同R（またはメインR）へ即座に切り替わります。</td></tr>'
         '<tr><td><strong>← 前R / 1R〜12R / 次R →</strong></td><td>選択中の競馬場の前後のレースや指定R番号へワンタップで移動し、出馬表と全オッズを自動取得します。</td></tr>'
         '<tr><td><strong>最新更新</strong></td><td>発走直前のオッズ変動を取り込むため、現在表示しているレースのオッズを再取得します。</td></tr>'

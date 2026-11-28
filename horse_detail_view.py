@@ -1,5 +1,5 @@
+from datetime import datetime
 import html
-import os
 import re
 import numpy as np
 import pandas as pd
@@ -11,6 +11,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Referer": "https://race.netkeiba.com/",
 }
+
+VENUE_RE = re.compile(
+    r"(札幌|函館|福島|新潟|東京|中山|中京|京都|阪神|小倉|大井|川崎|船橋|浦和|門別|盛岡|水沢|金沢|笠松|名古屋|園田|姫路|高知|佐賀|帯広|海外)"
+)
 
 
 def _make_soup(html_txt: str) -> BeautifulSoup:
@@ -43,131 +47,432 @@ def _decode_html(resp: requests.Response) -> str:
     return raw.decode("euc_jp", errors="replace")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_past5_details(race_id: str, horse_num: int) -> dict:
+def _norm_name(s: str) -> str:
+    return re.sub(r"\s+", "", str(s or "")).strip()
+
+
+def _short_date(d_str: str, ref_year: str = "") -> str:
+    s = str(d_str or "").strip().replace(".", "/")
+    m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
+    if not m:
+        return s or "-"
+    y, mo, dy = m.group(1), int(m.group(2)), int(m.group(3))
+    if ref_year and y == ref_year:
+        return f"{mo:02d}/{dy:02d}"
+    return f"{y[2:]}/{mo:02d}/{dy:02d}"
+
+
+def _parse_date_obj(d_str: str):
+    s = str(d_str or "").strip().replace(".", "/")
+    m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _clean_venue(v_str: str) -> str:
+    s = str(v_str or "").strip()
+    m = VENUE_RE.search(s)
+    if m:
+        return m.group(1)
+    s2 = re.sub(r"\d+", "", s).strip()
+    return s2[:4] if s2 else "-"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_race_horse_meta(race_id: str) -> dict:
     """
-    shutuba_past.html から指定馬番の過去5走の詳細成績と horse_id を取得する。
+    shutuba.html から全馬の horse_id・性齢（例: 牡4）・馬名マップを一括取得してキャッシュする。
     """
-    url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
-    result = {
-        "horse_id": "",
-        "horse_url": "",
-        "runs": [],
-        "error": "",
-    }
+    meta_by_num: dict[int, dict] = {}
+    url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            result["error"] = f"過去走ページの取得に失敗しました (HTTP {resp.status_code})"
-            return result
-
+            return meta_by_num
         soup = _make_soup(_decode_html(resp))
-        target_tr = None
         for tr in soup.select("tr.HorseList"):
-            num_el = tr.select_one("td.Waku + td") or tr.select_one("td[class*='Umaban']")
+            tds = tr.find_all("td")
+            num_el = tr.select_one("td[class*='Umaban']")
+            if num_el is None and len(tds) > 1:
+                num_el = tds[1]
             if not num_el:
                 continue
             ntxt = re.sub(r"\D", "", num_el.get_text(strip=True))
-            if ntxt.isdigit() and int(ntxt) == int(horse_num):
-                target_tr = tr
-                break
+            if not ntxt.isdigit():
+                continue
+            hnum = int(ntxt)
+
+            h_id = ""
+            h_name = ""
+            a_el = tr.select_one("span.HorseName a") or tr.select_one("a[href*='/horse/']")
+            if a_el:
+                h_name = a_el.get_text(strip=True)
+                hm = re.search(r"/horse/([a-zA-Z0-9]+)", a_el.get("href", ""))
+                if hm:
+                    h_id = hm.group(1)
+
+            barei_el = tr.select_one("td.Barei")
+            sex_age = barei_el.get_text(strip=True) if barei_el else ""
+            if not sex_age:
+                for td in tds:
+                    tt = td.get_text(strip=True)
+                    if re.match(r"^[牡牝セ]\d+$", tt):
+                        sex_age = tt
+                        break
+
+            meta_by_num[hnum] = {
+                "horse_id": h_id,
+                "horse_name": h_name,
+                "sex_age": sex_age,
+            }
+    except Exception:
+        pass
+    return meta_by_num
+
+
+def _parse_db_results_table(soup: BeautifulSoup) -> list[dict]:
+    """db.netkeiba.com の table.db_h_race_results から過去走一覧を列名ベースで抽出する"""
+    tbl = soup.select_one("table.db_h_race_results")
+    if not tbl:
+        return []
+
+    header_row = tbl.find("tr")
+    if not header_row:
+        return []
+    ths = [re.sub(r"\s+", "", th.get_text(strip=True)) for th in header_row.find_all(["th", "td"])]
+    col_map = {name: i for i, name in enumerate(ths)}
+
+    def _cell(tds, key_candidates: tuple[str, ...]) -> str:
+        for k in key_candidates:
+            if k in col_map and col_map[k] < len(tds):
+                return re.sub(r"\s+", " ", tds[col_map[k]].get_text(" ", strip=True)).strip()
+        return ""
+
+    runs = []
+    for tr in tbl.find_all("tr")[1:]:
+        tds = tr.find_all("td")
+        if len(tds) < 10:
+            continue
+        date_raw = _cell(tds, ("日付",))
+        if not re.match(r"^\d{4}/\d{1,2}/\d{1,2}$", date_raw):
+            continue
+
+        rank_raw = _cell(tds, ("着順",))
+        if not rank_raw:
+            continue
+        head_raw = re.sub(r"\D", "", _cell(tds, ("頭数",)))
+        pop_raw = re.sub(r"\D", "", _cell(tds, ("人気",)))
+        venue_raw = _clean_venue(_cell(tds, ("開催",)))
+        race_name = _cell(tds, ("レース名",))
+        jockey = _cell(tds, ("騎手",))
+        kinryo = _cell(tds, ("斤量",))
+        dist_raw = _cell(tds, ("距離",))
+        cond_raw = _cell(tds, ("馬場",))
+        time_raw = _cell(tds, ("タイム",))
+        diff_raw = _cell(tds, ("着差",))
+        pass_raw = _cell(tds, ("通過",))
+        agari_raw = _cell(tds, ("上り", "上がり"))
+        wt_raw = _cell(tds, ("馬体重",))
+        rival_raw = _cell(tds, ("勝ち馬(2着馬)", "勝ち馬"))
+
+        runs.append({
+            "date_full": date_raw,
+            "venue": venue_raw,
+            "race_name": race_name or "-",
+            "distance": dist_raw or "-",
+            "condition": cond_raw or "-",
+            "rank": rank_raw,
+            "head": head_raw,
+            "popularity": pop_raw,
+            "time": time_raw or "-",
+            "diff": diff_raw or "-",
+            "passing": pass_raw or "-",
+            "agari": agari_raw or "-",
+            "jockey": jockey or "-",
+            "kinryo": kinryo or "-",
+            "weight": wt_raw or "-",
+            "rival": rival_raw or "-",
+        })
+        if len(runs) >= 5:
+            break
+    return runs
+
+
+def _parse_shutuba_past_for_horse(race_id: str, horse_num: int, horse_name: str) -> dict:
+    """
+    race.netkeiba.com/race/shutuba_past.html から対象馬の過去5走と基本情報を抽出するフォールバック。
+    td.Waku に依存せず、馬名一致・複数列候補から確実に該当行を特定する。
+    """
+    out = {"horse_id": "", "sire": "", "bms": "", "sex_age": "", "runs": []}
+    url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return out
+        soup = _make_soup(_decode_html(resp))
+        target_tr = None
+        norm_target = _norm_name(horse_name)
+
+        rows = soup.select("tr.HorseList")
+        if norm_target:
+            for tr in rows:
+                row_txt = _norm_name(tr.get_text(" ", strip=True))
+                if norm_target in row_txt:
+                    target_tr = tr
+                    break
 
         if target_tr is None:
-            result["error"] = "出馬表の過去走データに対象馬が見つかりませんでした。"
-            return result
+            for tr in rows:
+                tds = tr.find_all("td")
+                cand_els = [
+                    tr.select_one("td[class*='Umaban']"),
+                    tr.select_one("td[class*='Num']"),
+                    tds[1] if len(tds) > 1 else None,
+                ]
+                for el in cand_els:
+                    if el is None:
+                        continue
+                    nt = re.sub(r"\D", "", el.get_text(strip=True))
+                    if nt.isdigit() and int(nt) == int(horse_num):
+                        target_tr = tr
+                        break
+                if target_tr is not None:
+                    break
 
-        h_link = target_tr.select_one("div.Horse02 a[href*='/horse/']") or target_tr.select_one("a[href*='/horse/']")
-        if h_link and h_link.get("href"):
-            href = h_link["href"]
-            hm = re.search(r"/horse/([a-zA-Z0-9]+)", href)
+        if target_tr is None:
+            return out
+
+        h_link = target_tr.select_one("a[href*='/horse/']")
+        if h_link:
+            hm = re.search(r"/horse/([a-zA-Z0-9]+)", h_link.get("href", ""))
             if hm:
-                result["horse_id"] = hm.group(1)
-                result["horse_url"] = f"https://db.netkeiba.com/horse/{hm.group(1)}/"
+                out["horse_id"] = hm.group(1)
 
+        info_td = target_tr.select_one("td.Horse_Info") or target_tr
+        info_txt = info_td.get_text(" ", strip=True)
+        m_sa = re.search(r"([牡牝セ]\d+)", info_txt)
+        if m_sa:
+            out["sex_age"] = m_sa.group(1)
+
+        h01 = target_tr.select_one("div.Horse01")
+        if h01:
+            out["sire"] = h01.get_text(" ", strip=True).strip()
+        h03 = target_tr.select_one("div.Horse03")
+        if h03:
+            bms_txt = h03.get_text(" ", strip=True)
+            m_bms = re.search(r"\(([^)]+)\)", bms_txt)
+            if m_bms:
+                out["bms"] = m_bms.group(1).strip()
+
+        past_tds = target_tr.select("td[class*='Past']")
         runs = []
-        past_tds = target_tr.select("td.Past")
-        for idx_p, ptd in enumerate(past_tds[:5], start=1):
+        for ptd in past_tds[:5]:
             full_txt = re.sub(r"\s+", " ", ptd.get_text(" ", strip=True))
-            if not full_txt or full_txt in ("-", "--"):
+            if not full_txt or full_txt in ("-", "--") or not re.search(r"\d{4}\.\d{2}\.\d{2}", full_txt):
                 continue
 
             d01 = ptd.select_one("div.Data01")
-            rank_el = ptd.select_one("span.Num")
-            rank_str = rank_el.get_text(strip=True) if rank_el else "-"
+            d02 = ptd.select_one("div.Data02")
+            d03 = ptd.select_one("div.Data03")
+            d05 = ptd.select_one("div.Data05")
+            d06 = ptd.select_one("div.Data06")
+            d07 = ptd.select_one("div.Data07")
 
             d01_txt = re.sub(r"\s+", " ", d01.get_text(" ", strip=True)) if d01 else full_txt
             m_date = re.search(r"(\d{4}\.\d{2}\.\d{2})", d01_txt)
-            date_val = m_date.group(1) if m_date else "-"
+            date_full = m_date.group(1).replace(".", "/") if m_date else ""
 
-            venue_val = "-"
-            if d01:
-                v_clean = re.sub(r"\d{4}\.\d{2}\.\d{2}", "", d01_txt)
-                if rank_str != "-":
-                    v_clean = re.sub(rf"\b{re.escape(rank_str)}\b", "", v_clean)
-                v_clean = v_clean.strip()
-                if v_clean:
-                    venue_val = v_clean.split()[0]
+            rank_el = ptd.select_one("span.Num")
+            rank_str = rank_el.get_text(strip=True) if rank_el else ""
+            if not rank_str and d01:
+                m_rk = re.search(r"\b(\d{1,2})\s*$", d01_txt)
+                rank_str = m_rk.group(1) if m_rk else "-"
 
-            d02 = ptd.select_one("div.Data02")
+            venue_val = _clean_venue(d01_txt)
             race_name = re.sub(r"\s+", " ", d02.get_text(" ", strip=True)) if d02 else "-"
 
-            d03 = ptd.select_one("div.Data03")
-            d03_txt = re.sub(r"\s+", " ", d03.get_text(" ", strip=True)) if d03 else ""
-            m_pop = re.search(r"(\d+)人", d03_txt)
-            pop_val = f"{m_pop.group(1)}人気" if m_pop else "-"
-            m_head = re.search(r"(\d+)頭", d03_txt)
-            head_val = f"{m_head.group(1)}頭" if m_head else "-"
+            d03_txt = re.sub(r"\s+", " ", d03.get_text(" ", strip=True)) if d03 else full_txt
+            m_head = re.search(r"(\d{1,2})頭", d03_txt)
+            head_val = m_head.group(1) if m_head else ""
+            m_pop = re.search(r"(\d{1,2})人", d03_txt)
+            pop_val = m_pop.group(1) if m_pop else ""
 
-            jockey_kinryo = re.sub(r"\d+頭|\d+番|\d+人", "", d03_txt).strip()
-            jockey_kinryo = re.sub(r"\s+", " ", jockey_kinryo) or "-"
+            j_clean = re.sub(r"\d+頭|\d+番|\d+人|\d{2}\.\d", "", d03_txt).strip()
+            jockey_val = j_clean.split()[0] if j_clean else "-"
 
-            d05 = ptd.select_one("div.Data05")
-            d05_txt = re.sub(r"\s+", " ", d05.get_text(" ", strip=True)) if d05 else ""
-            m_course = re.search(r"([芝ダ障]\d{3,4})", d05_txt)
-            course_val = m_course.group(1) if m_course else "-"
-            m_time = re.search(r"(\d+:\d{2}\.\d|\d{2}\.\d)", d05_txt)
+            d05_txt = re.sub(r"\s+", " ", d05.get_text(" ", strip=True)) if d05 else full_txt
+            m_dist = re.search(r"([芝ダ障]\d{3,4})", d05_txt)
+            dist_val = m_dist.group(1) if m_dist else "-"
+            m_time = re.search(r"(\d:\d{2}\.\d|\d{2}\.\d)", d05_txt)
             time_val = m_time.group(1) if m_time else "-"
             m_cond = re.search(r"(良|稍重|稍|重|不良)", d05_txt)
             cond_val = m_cond.group(1) if m_cond else "-"
 
-            d06 = ptd.select_one("div.Data06")
-            d06_txt = re.sub(r"\s+", " ", d06.get_text(" ", strip=True)) if d06 else ""
+            d06_txt = re.sub(r"\s+", " ", d06.get_text(" ", strip=True)) if d06 else full_txt
             m_agari = re.search(r"\((\d{2}\.\d)\)", d06_txt)
             agari_val = m_agari.group(1) if m_agari else "-"
-            m_wt = re.search(r"(\d{3}\([+-]?\d+\))", d06_txt)
+            m_wt = re.search(r"(\d{3}\([+-]?\d+\)|\d{3})", d06_txt)
             wt_val = m_wt.group(1) if m_wt else "-"
-            m_pass = re.search(r"^([\d-]+)", d06_txt)
-            pass_val = m_pass.group(1) if m_pass else "-"
 
-            d07 = ptd.select_one("div.Data07")
             d07_txt = re.sub(r"\s+", " ", d07.get_text(" ", strip=True)) if d07 else ""
             m_diff = re.search(r"\(([+-]?\d+\.\d)\)", d07_txt)
-            diff_val = f"{m_diff.group(1)}秒" if m_diff else "-"
-            rival_val = re.sub(r"\([+-]?\d+\.\d\)", "", d07_txt).strip() or "-"
+            diff_val = m_diff.group(1) if m_diff else "-"
 
             runs.append({
-                "走前": f"{idx_p}走前",
-                "日付": date_val,
-                "開催": venue_val,
-                "レース名": race_name,
-                "条件": f"{course_val} ({cond_val})" if course_val != "-" else "-",
-                "頭数": head_val,
-                "人気": pop_val,
-                "着順": f"{rank_str}着" if rank_str.isdigit() else rank_str,
-                "タイム": time_val,
-                "着差": diff_val,
-                "通過": pass_val,
-                "上がり3F": agari_val,
-                "騎手・斤量": jockey_kinryo,
-                "馬体重": wt_val,
-                "勝ち馬(2着馬)": rival_val,
+                "date_full": date_full,
+                "venue": venue_val,
+                "race_name": race_name,
+                "distance": dist_val,
+                "condition": cond_val,
+                "rank": rank_str or "-",
+                "head": head_val,
+                "popularity": pop_val,
+                "time": time_val,
+                "diff": diff_val,
+                "passing": "-",
+                "agari": agari_val,
+                "jockey": jockey_val,
+                "kinryo": "-",
+                "weight": wt_val,
+                "rival": "-",
             })
 
-        result["runs"] = runs
-    except Exception as exc:
-        result["error"] = f"過去走データの取得中にエラーが発生しました: {exc}"
+        out["runs"] = runs
+    except Exception:
+        pass
+    return out
 
-    return result
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_horse_profile_and_past5(race_id: str, horse_num: int, horse_name: str) -> dict:
+    """
+    4段フォールバックで確実に個別馬の基本プロフィール（性齢・厩舎・血統・通算成績）と過去5走詳細を取得する。
+    """
+    info = {
+        "horse_id": "",
+        "horse_url": "",
+        "sex_age": "",
+        "trainer": "",
+        "sire": "",
+        "bms": "",
+        "career": "",
+        "runs": [],
+    }
+
+    # 1. shutuba.html メタ情報
+    meta_map = _fetch_race_horse_meta(race_id)
+    h_meta = meta_map.get(int(horse_num), {})
+    if not h_meta and horse_name:
+        norm_t = _norm_name(horse_name)
+        for v in meta_map.values():
+            if _norm_name(v.get("horse_name", "")) == norm_t:
+                h_meta = v
+                break
+
+    horse_id = str(h_meta.get("horse_id", "") or "")
+    info["sex_age"] = str(h_meta.get("sex_age", "") or "")
+
+    past_fb = None
+    if not horse_id:
+        past_fb = _parse_shutuba_past_for_horse(race_id, horse_num, horse_name)
+        horse_id = past_fb.get("horse_id", "")
+        if not info["sex_age"]:
+            info["sex_age"] = past_fb.get("sex_age", "")
+        info["sire"] = past_fb.get("sire", "")
+        info["bms"] = past_fb.get("bms", "")
+        info["runs"] = past_fb.get("runs", [])
+
+    if horse_id:
+        info["horse_id"] = horse_id
+        info["horse_url"] = f"https://db.netkeiba.com/horse/{horse_id}/"
+        db_headers = {**HEADERS, "Referer": "https://db.netkeiba.com/"}
+
+        # 2. db.netkeiba.com/horse/{horse_id}/
+        try:
+            resp = requests.get(info["horse_url"], headers=db_headers, timeout=12)
+            if resp.status_code == 200:
+                soup = _make_soup(_decode_html(resp))
+
+                if not info["sex_age"]:
+                    p01 = soup.select_one("div.horse_title p.txt_01") or soup.select_one("p.txt_01")
+                    if p01:
+                        m_sa = re.search(r"([牡牝セ]\d+)", p01.get_text(" ", strip=True))
+                        if m_sa:
+                            info["sex_age"] = m_sa.group(1)
+
+                prof_tbl = soup.select_one("table.db_prof_table")
+                if prof_tbl:
+                    for tr in prof_tbl.find_all("tr"):
+                        th = tr.find("th")
+                        td = tr.find("td")
+                        if not th or not td:
+                            continue
+                        k_txt = th.get_text(strip=True)
+                        v_txt = re.sub(r"\s+", " ", td.get_text(" ", strip=True)).strip()
+                        if "調教師" in k_txt and v_txt:
+                            info["trainer"] = v_txt
+                        elif "通算成績" in k_txt and v_txt:
+                            info["career"] = v_txt
+
+                blood_tbl = soup.select_one("table.blood_table")
+                if blood_tbl:
+                    b_trs = blood_tbl.find_all("tr")
+                    if len(b_trs) >= 1:
+                        td0 = b_trs[0].find("td")
+                        if td0:
+                            a0 = td0.find("a")
+                            info["sire"] = a0.get_text(strip=True) if a0 else td0.get_text(" ", strip=True).split()[0]
+                    if len(b_trs) >= 3:
+                        tds2 = b_trs[2].find_all("td")
+                        if len(tds2) >= 2:
+                            a_bms = tds2[1].find("a")
+                            info["bms"] = a_bms.get_text(strip=True) if a_bms else tds2[1].get_text(" ", strip=True).split()[0]
+
+                db_runs = _parse_db_results_table(soup)
+                if db_runs:
+                    info["runs"] = db_runs
+        except Exception:
+            pass
+
+        # 3. AJAX / result サブページからの戦績取得
+        if not info["runs"]:
+            ajax_headers = {
+                **db_headers,
+                "Referer": info["horse_url"],
+                "X-Requested-With": "XMLHttpRequest",
+            }
+            for sub_url in (
+                f"https://db.netkeiba.com/horse/ajax_horse_results.html?id={horse_id}",
+                f"https://db.netkeiba.com/horse/result/{horse_id}/",
+            ):
+                try:
+                    resp_s = requests.get(sub_url, headers=ajax_headers, timeout=12)
+                    if resp_s.status_code != 200:
+                        continue
+                    soup_s = _make_soup(_decode_html(resp_s))
+                    sub_runs = _parse_db_results_table(soup_s)
+                    if sub_runs:
+                        info["runs"] = sub_runs
+                        break
+                except Exception:
+                    continue
+
+    # 4. 最終フォールバック: shutuba_past.html
+    if not info["runs"]:
+        if past_fb is None:
+            past_fb = _parse_shutuba_past_for_horse(race_id, horse_num, horse_name)
+        if past_fb.get("runs"):
+            info["runs"] = past_fb["runs"]
+        if not info["sire"] and past_fb.get("sire"):
+            info["sire"] = past_fb["sire"]
+        if not info["bms"] and past_fb.get("bms"):
+            info["bms"] = past_fb["bms"]
+
+    return info
 
 
 def analyze_feature_contributions(
@@ -209,34 +514,34 @@ def analyze_feature_contributions(
 
     groups = [
         {
-            "name": "近3走の着順・勢い",
+            "name": "近3走の着順",
             "cols": ["prev1_rank", "prev2_rank", "prev3_rank", "avg_prev_rank", "best_prev_rank", "rank_trend", "rel_prev_rank"],
-            "desc": f"前走{p1_v}着 / 2走前{p2_v}着 / 3走前{p3_v}着",
+            "desc": f"{p1_v}着→{p2_v}着→{p3_v}着",
         },
         {
-            "name": "前走タイム差（内容の濃さ）",
+            "name": "前走タイム差",
             "cols": ["prev1_time_diff", "rel_time_diff"],
-            "desc": f"前走勝ち馬との差 {td_v:.2f}秒",
+            "desc": f"{td_v:.2f}秒差",
         },
         {
-            "name": "騎手の実績・コース相性",
+            "name": "騎手実績",
             "cols": ["jockey_id"],
-            "desc": f"騎乗: {jk_v}",
+            "desc": jk_v,
         },
         {
-            "name": "調教師（厩舎力）",
+            "name": "厩舎力",
             "cols": ["trainer_id"],
-            "desc": f"厩舎: {tr_v}",
+            "desc": tr_v,
         },
         {
-            "name": "枠順・馬番の有利不利",
+            "name": "枠順・馬番",
             "cols": ["frame_num", "horse_num"],
-            "desc": f"{fr_v}枠 {hn_v}番",
+            "desc": f"{fr_v}枠{hn_v}番",
         },
         {
-            "name": "斤量・馬体重バランス",
+            "name": "斤量・馬体",
             "cols": ["weight_carried", "horse_weight", "weight_diff", "abs_weight_diff", "weight_ratio"],
-            "desc": f"斤量{wc_v:.1f}kg / 馬体重{hw_v}kg ({wd_v:+d})",
+            "desc": f"{wc_v:.1f}kg / {hw_v}kg({wd_v:+d})",
         },
     ]
 
@@ -283,9 +588,7 @@ def build_signal_explanation(
     ev_threshold: float,
     exclude_fav1: bool,
 ) -> dict:
-    """
-    シグナル（軸・穴注目・紐候補・様子見）および信頼度（S/A/B/-）の判定理由を具体的に文章化する。
-    """
+    """シグナル（軸・穴注目・紐候補・様子見）と信頼度の判定理由を生成する"""
     ai_rank = int(row["ai_rank"])
     pop = int(row["popularity"])
     win_p = float(row["pred_win_pct"])
@@ -303,93 +606,49 @@ def build_signal_explanation(
         sig_color = "#dc2626"
         sig_bg = "#fef2f2"
         main_reason = (
-            f"出走{len(race_df)}頭の中でAI予測勝率が1位（{win_p:.1f}% / 能力値 {ability:.1f}）であり、"
-            f"3着内率も{place_p:.1f}%と高水準なため、馬券の中心となる『軸』判定となりました。"
+            f"出走{len(race_df)}頭中でAI勝率1位（{win_p:.1f}%・能力値{ability:.1f}）、"
+            f"3着内率も{place_p:.1f}%と抜けており、馬券の中心『軸』判定。"
         )
     elif ev >= ev_threshold and win_p >= 4.0:
         sig_label = "穴注目"
         sig_color = "#c2410c"
         sig_bg = "#fff7ed"
         main_reason = (
-            f"単勝オッズ{odds:.1f}倍（{pop}番人気）の市場評価（想定勝率 {mkt_implied_pct:.1f}%）に対し、"
-            f"AIは勝率 {win_p:.1f}% と高く評価しています。単勝期待値(EV)が {ev:.2f} と基準値（{ev_threshold:.2f}）を"
-            f"上回り、勝率も最低ライン（4.0%）を超えているため、妙味抜群の『穴注目』判定となりました。"
+            f"{pop}番人気（{odds:.1f}倍・市場評価{mkt_implied_pct:.1f}%）に対しAI勝率{win_p:.1f}%。"
+            f"単勝EV {ev:.2f}（基準{ev_threshold:.2f}超）で妙味抜群のため『穴注目』判定。"
         )
     elif ai_rank <= 6 or place_p >= 25.0:
         sig_label = "紐候補"
-        sig_color = "#1d4ed8"
+        sig_color = "#2563eb"
         sig_bg = "#eff6ff"
-        cond_parts = []
-        if ai_rank <= 6:
-            cond_parts.append(f"AI総合順位が上位6頭以内（{ai_rank}位）")
-        if place_p >= 25.0:
-            cond_parts.append(f"3着内率が25%以上（{place_p:.1f}%）")
-        joined = "かつ".join(cond_parts)
         if ai_rank == 1 and exclude_fav1 and pop == 1:
-            main_reason = (
-                f"AI順位は1位（勝率 {win_p:.1f}%）ですが、「1番人気を軸から除外」設定がONのため軸指定を見送り、"
-                f"相手筆頭の『紐候補』としています。"
-            )
+            main_reason = "AI勝率1位ですが「1番人気除外」ONのため軸を見送り『紐候補』判定。"
         else:
             main_reason = (
-                f"{joined}を満たしているため、2・3着の連下・三連複の相手として押さえるべき『紐候補』判定となりました。"
-                f"（単勝EVは {ev:.2f} のため、単勝狙いより連系馬券の相手向きです）"
+                f"AI順位{ai_rank}位・3着内率{place_p:.1f}%と連対・複勝圏内の実力があり、"
+                f"連系馬券の相手として押さえる『紐候補』判定（単勝EV {ev:.2f}）。"
             )
     else:
         sig_label = "様子見"
-        sig_color = "#475569"
+        sig_color = "#64748b"
         sig_bg = "#f8fafc"
         main_reason = (
-            f"AI順位が{ai_rank}位（勝率 {win_p:.1f}% / 3着内率 {place_p:.1f}%）、単勝EVも {ev:.2f} に留まるため、"
-            f"現時点のオッズでは積極的な投資妙味が薄い『様子見』判定です。"
+            f"AI順位{ai_rank}位（勝率{win_p:.1f}%・3着内率{place_p:.1f}%）、単勝EV {ev:.2f}のため"
+            "現オッズでは投資妙味が薄く『様子見』判定。"
         )
 
     if ai_rank == 1 and win_p >= 22.0:
-        conf_label = "S"
-        conf_reason = f"AI1位かつ予測勝率が22%超（{win_p:.1f}%）の抜けた評価のため、最高ランク『S』です。"
+        conf_label = "信頼度 S"
+        conf_color = "#dc2626"
     elif ai_rank == 1 or (ai_rank == 2 and win_p >= 14.0):
-        conf_label = "A"
-        conf_reason = f"AI上位（{ai_rank}位）かつ高い勝率（{win_p:.1f}%）を維持しているため、有力ランク『A』です。"
+        conf_label = "信頼度 A"
+        conf_color = "#dc2626"
     elif ai_rank <= 3 and win_p >= 9.0:
-        conf_label = "B"
-        conf_reason = f"AIトップ3（{ai_rank}位）かつ勝率9%以上（{win_p:.1f}%）のため、標準上位ランク『B』です。"
+        conf_label = "信頼度 B"
+        conf_color = "#d97706"
     else:
-        conf_label = "-"
-        conf_reason = "上位抜擢基準（AI3位以内＆勝率9%以上）を下回るため、信頼度ランクは付与されていません。"
-
-    bullets = []
-    if gap_pct >= 2.0:
-        bullets.append(
-            f"オッズとのギャップ（妙味）：市場評価 {mkt_implied_pct:.1f}% に対し AI予測 {win_p:.1f}%（+{gap_pct:.1f}pt 過小評価）"
-        )
-    elif gap_pct <= -2.0:
-        bullets.append(
-            f"オッズとのギャップ（過剰人気気味）：市場評価 {mkt_implied_pct:.1f}% に対し AI予測 {win_p:.1f}%（{gap_pct:.1f}pt 割高）"
-        )
-    else:
-        bullets.append(
-            f"オッズとの整合性：市場評価 {mkt_implied_pct:.1f}% と AI予測 {win_p:.1f}% が概ね一致しています"
-        )
-
-    p1 = int(row.get("prev1_rank", 7))
-    p2 = int(row.get("prev2_rank", 7))
-    p3 = int(row.get("prev3_rank", 7))
-    avg_p = (p1 + p2 + p3) / 3.0
-    race_avg_p = float(race_df[["prev1_rank", "prev2_rank", "prev3_rank"]].mean(axis=1).mean())
-    if avg_p < race_avg_p - 0.5:
-        bullets.append(f"直近3走の安定感：平均着順 {avg_p:.1f}着（出走馬平均 {race_avg_p:.1f}着より優秀）")
-    elif p1 <= 3:
-        bullets.append(f"前走好走の勢い：前走 {p1}着（2走前 {p2}着 / 3走前 {p3}着）")
-    else:
-        bullets.append(f"直近3走の推移：前走 {p1}着 → 2走前 {p2}着 → 3走前 {p3}着（出走馬平均 {race_avg_p:.1f}着）")
-
-    tdiff = float(row.get("prev1_time_diff", 0.8))
-    if tdiff <= 0.3:
-        bullets.append(f"前走の着差が優秀：勝ち馬と {tdiff:.2f}秒差の接戦・好内容")
-    elif tdiff >= 1.5:
-        bullets.append(f"前走の着差に課題：勝ち馬から {tdiff:.2f}秒離されており、巻き返し条件が鍵")
-
-    bullets.append(f"ハービル連対・複勝見込み：勝率 {win_p:.1f}% ／ 2着内率 {quin_p:.1f}% ／ 3着内率 {place_p:.1f}%")
+        conf_label = ""
+        conf_color = "#64748b"
 
     return {
         "sig_label": sig_label,
@@ -397,217 +656,301 @@ def build_signal_explanation(
         "sig_bg": sig_bg,
         "main_reason": main_reason,
         "conf_label": conf_label,
-        "conf_reason": conf_reason,
-        "bullets": bullets,
+        "conf_color": conf_color,
         "mkt_implied_pct": mkt_implied_pct,
         "gap_pct": gap_pct,
     }
 
 
-def render_horse_detail_page(
+def render_horse_side_panel(
+    race_df: pd.DataFrame,
+    selected_horse_num: int,
     race_id: str,
     date_str: str,
-    horse_num: int,
-    ai_weight: float,
     ev_threshold: float,
     exclude_fav1: bool,
     model,
     feature_cols: list[str],
     category_maps: dict,
     train_model,
-    shutuba_scraper,
-    calculate_horse_place_probs,
 ):
     """
-    別タブで開かれた馬詳細ページ（過去5走成績 ＋ シグナル判定理由 ＋ AI特徴量寄与度）を描画する。
+    出走表の右側に並ぶインライン馬詳細パネルを描画する。
+    「‹ 前の馬 | 1 / N | 次の馬 ›」「✕」「シグナル根拠」「基本」「近5走」を1カード内に表示する。
     """
-    st.markdown(
-        """
-<div class="top-navbar">
-  <div class="brand">KAZUYAN AI <span style="font-size:0.85rem; font-weight:600; color:#cbd5e1; margin-left:8px;">個別馬AI診断・過去5走レポート</span></div>
-  <div class="nav-badges">
-    <a href="?" style="color:#ffffff; text-decoration:none; background:rgba(255,255,255,0.18); padding:5px 12px; border-radius:6px; font-weight:700;">← レース一覧へ戻る</a>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    ordered_df = race_df.sort_values("ai_rank", ascending=True).reset_index(drop=True)
+    total_n = len(ordered_df)
+    matches = ordered_df.index[ordered_df["horse_num"].astype(int) == int(selected_horse_num)].tolist()
+    cur_idx = matches[0] if matches else 0
+    row = ordered_df.iloc[cur_idx]
 
-    race_df = None
-    if os.path.exists("data/upcoming_race.csv"):
-        try:
-            cached_df = pd.read_csv("data/upcoming_race.csv", dtype={"race_id": str})
-            if not cached_df.empty and str(cached_df["race_id"].iloc[0]) == str(race_id):
-                race_df = cached_df
-        except Exception:
-            race_df = None
+    h_num = int(row["horse_num"])
+    h_name = str(row["horse_name"])
+    jockey_now = str(row.get("jockey_id", "-"))
+    kinryo_now = float(row.get("weight_carried", 56.0))
+    trainer_now = str(row.get("trainer_id", "-"))
+    pop_now = int(row["popularity"])
+    odds_now = float(row["win_odds"])
+    win_p = float(row["pred_win_pct"])
+    quin_p = float(row["pred_quinella_pct"])
+    place_p = float(row["pred_place_pct"])
+    ev_now = float(row["単勝期待値(EV)"])
 
-    if race_df is None:
-        with st.spinner("対象レースの出馬表とオッズを取得中..."):
-            try:
-                bundle = shutuba_scraper.fetch_shutuba_and_odds(race_id=race_id, date_str=date_str)
-                race_df = bundle["shutuba_df"].copy()
-            except Exception as exc:
-                st.error(f"レースデータの読み込みに失敗しました: {exc}")
-                return
+    exp = build_signal_explanation(row, ordered_df, ev_threshold=ev_threshold, exclude_fav1=exclude_fav1)
 
-    feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
-    raw_probs = model.predict_proba(feat_df[feature_cols])[:, 1]
-    ai_pure_prob = raw_probs / raw_probs.sum()
+    with st.container(border=True):
+        # 1. ヘッダー行（馬番・馬名・モデルバッジ・✕閉じる）
+        h_c1, h_c2 = st.columns([5.2, 1.0])
+        with h_c1:
+            h_name_esc = html.escape(h_name)
+            j_esc = html.escape(jockey_now)
+            st.markdown(
+                f'<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:2px;">'
+                f'<span style="font-size:1.12rem; font-weight:800; color:#0f172a;">{h_num}番 {h_name_esc}</span>'
+                f'<span style="font-size:0.72rem; color:#2563eb; background:#eff6ff; border:1px solid #bfdbfe; '
+                f'padding:1px 7px; border-radius:999px; font-weight:700;">KAZUYAN AI</span>'
+                f'</div>'
+                f'<div style="font-size:0.82rem; color:#64748b; margin-bottom:6px;">{j_esc} {kinryo_now:.1f}kg</div>',
+                unsafe_allow_html=True,
+            )
+        with h_c2:
+            if st.button("✕", key="btn_close_horse_panel", help="詳細パネルを閉じる", width="stretch"):
+                st.session_state["selected_detail_horse"] = None
+                try:
+                    if "horse" in st.query_params:
+                        del st.query_params["horse"]
+                except Exception:
+                    pass
+                st.rerun()
 
-    mkt_raw = 0.80 / np.clip(race_df["win_odds"].to_numpy(dtype=float), 1.1, 500.0)
-    mkt_prob = mkt_raw / mkt_raw.sum()
+        # 2. 前後の馬ナビゲーション（‹ 前の馬 | 1 / N | 次の馬 ›）
+        nav1, nav2, nav3 = st.columns([1.6, 0.9, 1.6])
+        with nav1:
+            if st.button("‹ 前の馬", key="btn_panel_prev_horse", disabled=(cur_idx <= 0), width="stretch"):
+                prev_h = int(ordered_df.iloc[cur_idx - 1]["horse_num"])
+                st.session_state["selected_detail_horse"] = prev_h
+                st.rerun()
+        with nav2:
+            st.markdown(
+                f'<div style="text-align:center; font-weight:800; color:#1e293b; padding-top:8px; font-size:0.9rem;">{cur_idx + 1} / {total_n}</div>',
+                unsafe_allow_html=True,
+            )
+        with nav3:
+            if st.button(
+                "次の馬 ›",
+                key="btn_panel_next_horse",
+                type="primary",
+                disabled=(cur_idx >= total_n - 1),
+                width="stretch",
+            ):
+                next_h = int(ordered_df.iloc[cur_idx + 1]["horse_num"])
+                st.session_state["selected_detail_horse"] = next_h
+                st.rerun()
 
-    blended_prob = (ai_weight * ai_pure_prob) + ((1.0 - ai_weight) * mkt_prob)
-    race_df["win_prob"] = blended_prob / blended_prob.sum()
-    race_df["ai_pure_pct"] = ai_pure_prob * 100.0
-    race_df = calculate_horse_place_probs(race_df, prob_col="win_prob")
+        # 3. バッジ行（AI順位・シグナル・信頼度・単勝EV）
+        badges = [
+            f'<span style="background:#dc2626; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 9px; border-radius:5px;">AI{cur_idx + 1}位</span>',
+            f'<span style="background:{exp["sig_color"]}; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 10px; border-radius:5px;">{html.escape(exp["sig_label"])}</span>',
+        ]
+        if exp["conf_label"]:
+            badges.append(
+                f'<span style="background:{exp["conf_color"]}; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 9px; border-radius:5px;">{html.escape(exp["conf_label"])}</span>'
+            )
+        ev_badge_bg = "#f59e0b" if ev_now >= ev_threshold else "#475569"
+        badges.append(
+            f'<span style="background:{ev_badge_bg}; color:#fff; font-weight:800; font-size:0.74rem; padding:3px 9px; border-radius:5px;">単勝EV {ev_now:.2f}</span>'
+        )
+        badges_html = "".join(badges)
 
-    race_df["popularity"] = race_df["win_odds"].rank(method="min", ascending=True).astype(int)
-    race_df["単勝期待値(EV)"] = (race_df["pred_win_pct"] / 100.0) * race_df["win_odds"]
-    p_mean = race_df["pred_win_pct"].mean()
-    p_std = max(race_df["pred_win_pct"].std(), 1e-6)
-    race_df["ability_score"] = np.clip(50.0 + ((race_df["pred_win_pct"] - p_mean) / p_std) * 8.5, 35.0, 78.0).round(1)
+        st.markdown(
+            f'<div style="display:flex; gap:6px; flex-wrap:wrap; margin:10px 0 8px 0;">{badges_html}</div>'
+            f'<div style="display:flex; justify-content:space-between; align-items:center; background:#f8fafc; '
+            f'border:1px solid #e2e8f0; border-radius:7px; padding:7px 11px; margin-bottom:8px; font-size:0.84rem;">'
+            f'<span><strong>{pop_now}番人気</strong> ／ 単勝 <strong>{odds_now:.1f}倍</strong></span>'
+            f'<span style="color:#dc2626; font-weight:800;">能力値 {float(row["ability_score"]):.1f}</span>'
+            f'</div>'
+            f'<div style="font-size:0.86rem; color:#0f172a; font-weight:700; margin-bottom:8px;">'
+            f'勝率 {win_p:.1f}%、2着内率 {quin_p:.1f}%、3着内率 {place_p:.1f}%。</div>',
+            unsafe_allow_html=True,
+        )
 
-    race_df = race_df.sort_values("pred_win_pct", ascending=False).reset_index(drop=True)
-    race_df["ai_rank"] = np.arange(1, len(race_df) + 1)
-    marks = ["◎", "○", "▲", "△", "☆"]
-    race_df["印"] = [marks[i] if i < len(marks) else "--" for i in range(len(race_df))]
-
-    target_rows = race_df[race_df["horse_num"].astype(int) == int(horse_num)]
-    if target_rows.empty:
-        st.error(f"馬番 {horse_num} のデータが見つかりませんでした。")
-        return
-
-    row = target_rows.iloc[0]
-    exp = build_signal_explanation(row, race_df, ev_threshold=ev_threshold, exclude_fav1=exclude_fav1)
-
-    waku = int(np.clip(row["frame_num"], 1, 8))
-    h_name = html.escape(str(row["horse_name"]))
-    mark_esc = html.escape(str(row["印"]))
-    jockey = html.escape(str(row["jockey_id"]))
-    trainer = html.escape(str(row.get("trainer_id", "-")))
-    venue = html.escape(str(row.get("venue", "")))
-    r_num = int(str(race_id)[-2:]) if len(str(race_id)) >= 2 and str(race_id)[-2:].isdigit() else 11
-    r_title = html.escape(str(row.get("race_title", f"{venue}{r_num}R")))
-    surf = "ダ" if "ダ" in str(row.get("surface", "芝")) else "芝"
-    dist = int(float(row.get("distance", 2000)))
-    cond = html.escape(str(row.get("track_condition", "良")))
-    ai_rk = int(row["ai_rank"])
-    w_car = float(row["weight_carried"])
-    w_odd = float(row["win_odds"])
-    pop_i = int(row["popularity"])
-    ev_v = float(row["単勝期待値(EV)"])
-    ab_v = float(row["ability_score"])
-
-    header_html = (
-        '<div class="race-banner">'
-        '<div>'
-        '<div class="race-title-row">'
-        f'<span class="waku-badge waku-{waku}">{waku}</span>'
-        f'<span class="race-venue-r">{int(horse_num)}番 {h_name}</span>'
-        f'<span class="race-time">印: {mark_esc} ／ AI {ai_rk}位</span>'
-        '</div>'
-        '<div class="race-meta-row" style="margin-top:8px;">'
-        f'<span>{venue} {r_num}R {r_title}（{surf}{dist}m・{cond}）</span>'
-        f'<span>騎手: {jockey}（{w_car:.1f}kg）</span>'
-        f'<span>厩舎: {trainer}</span>'
-        f'<span>単勝: {w_odd:.1f}倍（{pop_i}人気）</span>'
-        '</div>'
-        '</div>'
-        '<div class="ring-group">'
-        '<div class="ring-circle ring-orange">'
-        f'<span class="ring-num-orange">{ev_v:.2f}</span>'
-        '<span class="ring-label">単勝EV</span>'
-        '</div>'
-        '<div class="ring-circle ring-green">'
-        f'<span class="ring-num-green">{ab_v:.1f}</span>'
-        '<span class="ring-label">能力値</span>'
-        '</div>'
-        '</div>'
-        '</div>'
-    )
-    st.markdown(header_html, unsafe_allow_html=True)
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("AI予測勝率", f"{float(row['pred_win_pct']):.1f}%", f"純粋AI: {float(row['ai_pure_pct']):.1f}%")
-    k2.metric("2着内率（連対）", f"{float(row['pred_quinella_pct']):.1f}%")
-    k3.metric("3着内率（複勝）", f"{float(row['pred_place_pct']):.1f}%")
-    k4.metric("市場想定勝率", f"{exp['mkt_implied_pct']:.1f}%", f"乖離: {exp['gap_pct']:+.1f}pt")
-    k5.metric("単勝期待値 (EV)", f"{ev_v:.2f}", f"基準: {ev_threshold:.2f}")
-
-    st.markdown("### 1. シグナル判定理由・AI評価の根拠")
-
-    bullets_html = "".join(f"<li style='margin-bottom:5px;'>{html.escape(b)}</li>" for b in exp["bullets"])
-    sig_bg = exp["sig_bg"]
-    sig_col = exp["sig_color"]
-    sig_lbl = html.escape(exp["sig_label"])
-    conf_lbl = html.escape(exp["conf_label"])
-    main_r_esc = html.escape(exp["main_reason"])
-    conf_r_esc = html.escape(exp["conf_reason"])
-
-    sig_card_html = (
-        f'<div style="background:{sig_bg}; border:1px solid #cbd5e1; border-left:6px solid {sig_col}; '
-        'border-radius:10px; padding:16px 20px; margin-bottom:16px;">'
-        '<div style="display:flex; align-items:center; gap:12px; margin-bottom:8px;">'
-        f'<span style="background:{sig_col}; color:#ffffff; font-weight:800; padding:4px 14px; border-radius:6px; font-size:0.95rem;">シグナル：{sig_lbl}</span>'
-        f'<span style="font-weight:800; color:#192442; font-size:0.95rem;">信頼度ランク：{conf_lbl}</span>'
-        '</div>'
-        f'<p style="color:#0f172a; font-weight:700; font-size:0.96rem; line-height:1.6; margin-bottom:8px;">{main_r_esc}</p>'
-        f'<p style="color:#475569; font-size:0.86rem; margin-bottom:10px;"><strong>信頼度の根拠：</strong>{conf_r_esc}</p>'
-        f'<ul style="margin:0; padding-left:20px; color:#1e293b; font-size:0.88rem;">{bullets_html}</ul>'
-        '</div>'
-    )
-    st.markdown(sig_card_html, unsafe_allow_html=True)
-
-    with st.spinner("AIモデルの評価内訳を計算中..."):
+        # 4. シグナル判定理由 ＆ AI評価根拠
         contribs = analyze_feature_contributions(
-            race_df=race_df,
-            target_horse_num=horse_num,
+            race_df=ordered_df,
+            target_horse_num=h_num,
             model=model,
             feature_cols=feature_cols,
             category_maps=category_maps,
             train_model=train_model,
         )
-
-    if contribs:
-        st.markdown("#### AIモデルの評価内訳（同レース出走馬の平均と比べた勝率への影響度）")
-        c_rows = []
-        for c_item in contribs:
+        factor_pills = []
+        for c_item in contribs[:4]:
             dp = float(c_item["delta_pct"])
-            if dp >= 0.5:
-                judge = "強いプラス要因"
-            elif dp > 0.05:
-                judge = "プラス要因"
-            elif dp <= -0.5:
-                judge = "マイナス要因"
-            elif dp < -0.05:
-                judge = "ややマイナス"
+            if dp >= 0.1:
+                c_bg, c_fg = "#fef2f2", "#dc2626"
+            elif dp <= -0.1:
+                c_bg, c_fg = "#eff6ff", "#1d4ed8"
             else:
-                judge = "平均並み"
-            c_rows.append({
-                "評価ファクター": c_item["factor"],
-                "この馬のデータ": c_item["detail"],
-                "勝率への寄与": f"{dp:+.2f}%",
-                "AI判定": judge,
-            })
-        st.dataframe(pd.DataFrame(c_rows), width="stretch", hide_index=True)
+                c_bg, c_fg = "#f1f5f9", "#475569"
+            f_esc = html.escape(c_item["factor"])
+            d_esc = html.escape(c_item["detail"])
+            factor_pills.append(
+                f'<div style="display:flex; justify-content:space-between; font-size:0.78rem; padding:3px 0; border-bottom:1px dashed #e2e8f0;">'
+                f'<span style="color:#334155;"><strong>{f_esc}</strong>（{d_esc}）</span>'
+                f'<span style="background:{c_bg}; color:{c_fg}; font-weight:800; padding:0 6px; border-radius:4px;">{dp:+.2f}%</span>'
+                f'</div>'
+            )
+        factors_body = "".join(factor_pills)
+        reason_esc = html.escape(exp["main_reason"])
+        gap_txt = f"{exp['gap_pct']:+.1f}pt"
 
-    st.markdown("### 2. 過去5走の成績詳細")
-    with st.spinner("過去5走の詳細成績を取得中..."):
-        past_info = fetch_past5_details(race_id=str(race_id), horse_num=int(horse_num))
+        st.markdown(
+            f'<div style="background:{exp["sig_bg"]}; border-left:4px solid {exp["sig_color"]}; border-radius:6px; '
+            f'padding:9px 11px; margin-bottom:12px;">'
+            f'<div style="font-size:0.78rem; font-weight:800; color:{exp["sig_color"]}; margin-bottom:3px;">なぜ「{html.escape(exp["sig_label"])}」？</div>'
+            f'<div style="font-size:0.81rem; color:#1e293b; line-height:1.45; margin-bottom:6px;">{reason_esc}</div>'
+            f'<div style="font-size:0.75rem; color:#475569; margin-bottom:4px;">市場評価 {exp["mkt_implied_pct"]:.1f}% vs AI勝率 {win_p:.1f}%（乖離 {gap_txt}）</div>'
+            f'{factors_body}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
-    if past_info["runs"]:
-        runs_df = pd.DataFrame(past_info["runs"])
-        st.dataframe(runs_df, width="stretch", hide_index=True)
-    else:
-        st.warning(past_info["error"] or "過去5走の詳細データを取得できませんでした（新馬戦・初出走、またはデータ未公開の可能性があります）。")
-        fallback_df = pd.DataFrame([
-            {"走前": "前走", "着順": f"{int(row.get('prev1_rank', 7))}着", "備考": f"前走タイム差 {float(row.get('prev1_time_diff', 0.8)):.2f}秒"},
-            {"走前": "2走前", "着順": f"{int(row.get('prev2_rank', 7))}着", "備考": "出馬表サマリーより"},
-            {"走前": "3走前", "着順": f"{int(row.get('prev3_rank', 7))}着", "備考": "出馬表サマリーより"},
-        ])
-        st.dataframe(fallback_df, width="stretch", hide_index=True)
+        # 5. Webから基本プロフィール＆近5走取得
+        with st.spinner("基本データ・近5走を取得中..."):
+            prof = fetch_horse_profile_and_past5(race_id=str(race_id), horse_num=h_num, horse_name=h_name)
 
-    if past_info.get("horse_url"):
-        st.link_button("netkeiba でこの馬の全戦績・血統を見る", url=past_info["horse_url"])
+        runs = prof.get("runs", [])
+        sex_age = prof.get("sex_age") or "-"
+        trainer_disp = prof.get("trainer") or trainer_now
+        sire = prof.get("sire") or ""
+        bms = prof.get("bms") or ""
+        blood_disp = f"父 {sire}・母父 {bms}" if (sire and bms) else (f"父 {sire}" if sire else "-")
+
+        if runs:
+            r0 = runs[0]
+            prev_rk_str = str(r0.get("rank", "-"))
+            prev_mark = "○ " if prev_rk_str.isdigit() and int(prev_rk_str) <= 3 else ""
+            prev_disp = f"{prev_mark}{prev_rk_str}着（{r0.get('venue', '')}{r0.get('distance', '')}）" if prev_rk_str.isdigit() else prev_rk_str
+
+            cur_dt = _parse_date_obj(date_str.replace("-", "/"))
+            prev_dt = _parse_date_obj(r0.get("date_full", ""))
+            if cur_dt and prev_dt and (cur_dt - prev_dt).days > 0:
+                days_gap = (cur_dt - prev_dt).days
+                weeks_gap = max(0, (days_gap - 1) // 7)
+                gap_disp = f"中{weeks_gap}週（中{days_gap}日）"
+            else:
+                gap_disp = "-"
+
+            prev_jk = str(r0.get("jockey", "") or "").strip()
+            if prev_jk and prev_jk != "-":
+                if _norm_name(prev_jk)[:2] == _norm_name(jockey_now)[:2]:
+                    jk_disp = f"○ 継続騎乗（{jockey_now}）"
+                else:
+                    jk_disp = f"△ 乗り替わり（前走 {prev_jk}）"
+            else:
+                jk_disp = jockey_now
+
+            num_ranks = [int(r["rank"]) for r in runs if str(r.get("rank", "")).isdigit()]
+            if num_ranks:
+                w_cnt = sum(1 for x in num_ranks if x == 1)
+                p_cnt = sum(1 for x in num_ranks if x <= 3)
+                w_rate = int(round(w_cnt / len(num_ranks) * 100))
+                p_rate = int(round(p_cnt / len(num_ranks) * 100))
+                recent_disp = f"直近{len(num_ranks)}走 勝率{w_rate}% / 複勝率{p_rate}%"
+            else:
+                recent_disp = "-"
+        else:
+            p1_fb = int(row.get("prev1_rank", 7))
+            prev_disp = f"{p1_fb}着（出馬表データ）"
+            gap_disp = "-"
+            jk_disp = jockey_now
+            recent_disp = "-"
+
+        career_disp = prof.get("career") or "-"
+
+        # 基本セクション
+        basic_rows = [
+            ("性齢", sex_age),
+            ("厩舎", trainer_disp),
+            ("血統", blood_disp),
+            ("前走", prev_disp),
+            ("間隔", gap_disp),
+            ("騎手", jk_disp),
+            ("近走", recent_disp),
+            ("通算", career_disp),
+        ]
+        basic_html_rows = "".join(
+            f'<tr>'
+            f'<td style="color:#64748b; width:46px; padding:3px 4px; font-weight:600; vertical-align:top;">{k}</td>'
+            f'<td style="color:#0f172a; padding:3px 4px; font-weight:600;">{html.escape(str(v))}</td>'
+            f'</tr>'
+            for k, v in basic_rows
+        )
+        st.markdown(
+            '<div style="font-size:0.84rem; font-weight:800; color:#192442; border-left:3.5px solid #4a154b; padding-left:7px; margin:8px 0 6px 0;">基本</div>'
+            f'<table style="width:100%; border-collapse:collapse; font-size:0.79rem; margin-bottom:12px;">{basic_html_rows}</table>',
+            unsafe_allow_html=True,
+        )
+
+        # 近5走セクション
+        st.markdown(
+            '<div style="font-size:0.84rem; font-weight:800; color:#192442; border-left:3.5px solid #2563eb; padding-left:7px; margin:8px 0 6px 0;">近5走</div>',
+            unsafe_allow_html=True,
+        )
+
+        if runs:
+            ref_y = str(date_str)[:4]
+            tr_parts = []
+            for r in runs[:5]:
+                d_s = html.escape(_short_date(r.get("date_full", ""), ref_year=ref_y))
+                v_s = html.escape(str(r.get("venue", "-")))
+                dist_s = html.escape(str(r.get("distance", "-")))
+                cond_s = html.escape(str(r.get("condition", "-")))
+                rk_raw = str(r.get("rank", "-"))
+                hd_raw = str(r.get("head", ""))
+                rk_disp = f"{rk_raw}/{hd_raw}" if (rk_raw.isdigit() and hd_raw) else rk_raw
+                if rk_raw == "1":
+                    rk_style = "color:#dc2626; font-weight:900;"
+                elif rk_raw == "2":
+                    rk_style = "color:#ea580c; font-weight:800;"
+                elif rk_raw == "3":
+                    rk_style = "color:#2563eb; font-weight:800;"
+                else:
+                    rk_style = "color:#334155; font-weight:600;"
+                pop_s = html.escape(str(r.get("popularity", "-") or "-"))
+                tm_s = html.escape(str(r.get("time", "-") or "-"))
+                ag_s = html.escape(str(r.get("agari", "-") or "-"))
+                wt_s = html.escape(str(r.get("weight", "-") or "-"))
+
+                tr_parts.append(
+                    '<tr style="border-bottom:1px solid #f1f5f9;">'
+                    f'<td style="padding:4px 2px; color:#475569;">{d_s}</td>'
+                    f'<td style="padding:4px 2px; color:#0f172a; font-weight:600;">{v_s}</td>'
+                    f'<td style="padding:4px 2px; color:#0f172a;">{dist_s}</td>'
+                    f'<td style="padding:4px 2px; color:#475569;">{cond_s}</td>'
+                    f'<td style="padding:4px 2px; {rk_style}">{html.escape(rk_disp)}</td>'
+                    f'<td style="padding:4px 2px; color:#475569;">{pop_s}</td>'
+                    f'<td style="padding:4px 2px; color:#0f172a;">{tm_s}</td>'
+                    f'<td style="padding:4px 2px; color:#0f172a;">{ag_s}</td>'
+                    f'<td style="padding:4px 2px; color:#475569; font-size:0.71rem;">{wt_s}</td>'
+                    '</tr>'
+                )
+            past_tbl_html = (
+                '<div style="overflow-x:auto; margin-bottom:10px;">'
+                '<table style="width:100%; border-collapse:collapse; font-size:0.74rem; text-align:center; white-space:nowrap;">'
+                '<thead><tr style="border-bottom:1.5px solid #cbd5e1; color:#64748b; font-size:0.71rem;">'
+                '<th style="padding:4px 2px;">日付</th><th style="padding:4px 2px;">場</th>'
+                '<th style="padding:4px 2px;">距離</th><th style="padding:4px 2px;">馬場</th>'
+                '<th style="padding:4px 2px;">着</th><th style="padding:4px 2px;">人気</th>'
+                '<th style="padding:4px 2px;">タイム</th><th style="padding:4px 2px;">上り</th>'
+                '<th style="padding:4px 2px;">体重</th>'
+                '</tr></thead>'
+                f'<tbody>{"".join(tr_parts)}</tbody>'
+                '</table></div>'
+            )
+            st.markdown(past_tbl_html, unsafe_allow_html=True)
+        else:
+            st.caption("過去5走の詳細データが見つかりませんでした（新馬・初出走、または取得制限の可能性があります）。")
+
+        if prof.get("horse_url"):
+            st.link_button("netkeibaで全戦績を見る", url=prof["horse_url"], width="stretch")
