@@ -1388,12 +1388,26 @@ with tab_main:
                 if int(r_q["horse_num"]) == int(sel_detail_h):
                     quick_idx = q_i
                     break
-        picked_q = st.selectbox(
+
+        quick_key = f"quick_horse_sel_{race_id_str}"
+        expected_q = quick_opts[quick_idx]
+        if st.session_state.get(quick_key) != expected_q:
+            st.session_state[quick_key] = expected_q
+
+        def _on_quick_horse_change(q_key: str, default_opt: str):
+            val = st.session_state.get(q_key, default_opt)
+            if val == default_opt:
+                st.session_state["selected_detail_horse"] = None
+            else:
+                st.session_state["selected_detail_horse"] = int(val.split("|")[1].strip().split()[0])
+
+        st.selectbox(
             "馬詳細クイック切替",
             quick_opts,
-            index=quick_idx,
+            key=quick_key,
             label_visibility="collapsed",
-            key=f"quick_horse_sel_{race_id_str}",
+            on_change=_on_quick_horse_change,
+            args=(quick_key, quick_opts[0]),
         )
         if picked_q != quick_opts[0]:
             picked_num = int(picked_q.split("|")[1].strip().split()[0])
