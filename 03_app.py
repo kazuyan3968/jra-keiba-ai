@@ -496,7 +496,7 @@ style_map = {
 }
 selected_style_mode = style_map[style_label]
 
-init_ai_w = float(st.session_state.pop("_init_ai_weight", 0.75))
+init_ai_w = float(st.session_state.pop("_init_ai_weight", 1.00))
 ai_weight = st.sidebar.slider(
     "AI独自度（低いほど実オッズの実力評価を加味）",
     min_value=0.40,

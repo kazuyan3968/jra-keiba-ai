@@ -27,19 +27,34 @@ HEADERS = {
 }
 
 
+def _make_soup(html_txt: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html_txt, "lxml")
+    except Exception:
+        return BeautifulSoup(html_txt, "html.parser")
+
+
 def decode_html(resp: requests.Response) -> str:
     raw = resp.content
     head = raw[:3500].lower()
-    if b"utf-8" in head or b"utf8" in head:
-        return raw.decode("utf-8", errors="replace")
-    if b"euc-jp" in head or b"euc_jp" in head:
-        return raw.decode("euc_jp", errors="replace")
-    if b"shift_jis" in head or b"shift-jis" in head or b"cp932" in head:
-        return raw.decode("cp932", errors="replace")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw.decode("euc_jp", errors="replace")
+    m = re.search(rb"charset\s*=\s*['\"]?([a-z0-9_-]+)", head)
+    if m:
+        enc = m.group(1).decode("ascii", errors="ignore")
+        if "euc" in enc:
+            return raw.decode("euc_jp", errors="replace")
+        if "shift" in enc or "sjis" in enc or "cp932" in enc:
+            return raw.decode("cp932", errors="replace")
+        if "utf" in enc:
+            try:
+                return raw.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                pass
+    for enc in ("utf-8", "euc_jp", "cp932"):
+        try:
+            return raw.decode(enc, errors="strict")
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("euc_jp", errors="replace")
 
 
 def _clean_race_title(raw_title: str) -> str:
@@ -75,7 +90,6 @@ def _extract_race_title(soup: BeautifulSoup, venue: str, race_num: int) -> str:
     """出馬表・結果ページからレース名を確実に抽出する（多段フォールバック）"""
     fallback_pattern = re.compile(rf"^{re.escape(venue)}\s*{race_num}R$")
 
-    # 1. RaceName 要素から取得
     for sel in ("div.RaceName", "h1.RaceName", "div.data_intro h1", "dl.racedata h1"):
         el = soup.select_one(sel)
         if el:
@@ -86,7 +100,6 @@ def _extract_race_title(soup: BeautifulSoup, venue: str, race_num: int) -> str:
                     txt = f"{txt} {grade}"
                 return txt
 
-    # 2. <title> タグから取得
     title_tag = soup.find("title")
     if title_tag:
         t_raw = title_tag.get_text(" ", strip=True)
@@ -95,7 +108,6 @@ def _extract_race_title(soup: BeautifulSoup, venue: str, race_num: int) -> str:
         if head_part and not fallback_pattern.match(head_part) and "netkeiba" not in head_part.lower():
             return head_part
 
-    # 3. RaceData02 のクラス表記（新馬・未勝利・1勝クラス等）から補完
     data02 = soup.select_one("div.RaceData02")
     if data02:
         spans = [sp.get_text(strip=True) for sp in data02.find_all("span") if sp.get_text(strip=True)]
@@ -113,7 +125,7 @@ def fetch_race_list_by_date(date_str: str) -> list[dict]:
     url = f"https://race.netkeiba.com/top/race_list_sub.html?kaisai_date={ymd}"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(decode_html(resp), "lxml")
+    soup = _make_soup(decode_html(resp))
 
     races = []
     seen = set()
@@ -151,7 +163,7 @@ def fetch_race_list_by_date(date_str: str) -> list[dict]:
         db_url = f"https://db.netkeiba.com/race/list/{ymd}/"
         resp_db = requests.get(db_url, headers=HEADERS, timeout=15)
         if resp_db.status_code == 200:
-            soup_db = BeautifulSoup(decode_html(resp_db), "lxml")
+            soup_db = _make_soup(decode_html(resp_db))
             for a_tag in soup_db.select('a[href*="/race/"]'):
                 m = re.search(r"/race/(\d{12})/", a_tag.get("href", ""))
                 if not m:
@@ -179,70 +191,146 @@ def fetch_race_list_by_date(date_str: str) -> list[dict]:
     return races
 
 
-def _fetch_jra_odds_api(race_id: str, odds_type: int) -> dict:
-    """netkeiba JRAオッズAPIから指定券種のオッズ辞書を取得する"""
-    url = (
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html"
-        f"?pid=api_get_jra_odds&input=UTF-8&output=json&race_id={race_id}&type={odds_type}&action=init&sort=odds&compress=1"
-    )
+def _decode_odds_data_field(raw_data) -> dict:
+    """APIレスポンスの data フィールド（辞書 / 非圧縮JSON文字列 / zlib・gzip・deflate圧縮Base64）を安全に復元する"""
+    if isinstance(raw_data, dict):
+        return raw_data
+    if not isinstance(raw_data, str) or not raw_data.strip():
+        return {}
+
+    s = raw_data.strip()
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        if resp.status_code != 200:
-            return {}
-        payload = resp.json()
-        raw_data = payload.get("data")
-        if not raw_data:
-            return {}
-        if isinstance(raw_data, str):
-            decoded = zlib.decompress(base64.b64decode(raw_data)).decode("utf-8", errors="replace")
-            data_obj = json.loads(decoded)
-        elif isinstance(raw_data, dict):
-            data_obj = raw_data
-        else:
-            return {}
-        odds_dict = data_obj.get("odds", {})
-        return odds_dict.get(str(odds_type), {}) if isinstance(odds_dict, dict) else {}
+        raw_bytes = base64.b64decode(s)
     except Exception:
         return {}
+
+    for wbits in (zlib.MAX_WBITS, 16 + zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            text = zlib.decompress(raw_bytes, wbits).decode("utf-8", errors="replace")
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return {}
+
+
+def _fetch_jra_odds_api(race_id: str, odds_type: int) -> dict:
+    """netkeiba JRAオッズAPIから指定券種のオッズ辞書を取得する（非圧縮優先＋圧縮・方式フォールバック）"""
+    api_headers = {
+        **HEADERS,
+        "Referer": f"https://race.netkeiba.com/odds/index.html?race_id={race_id}",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+
+    base_url = (
+        f"https://race.netkeiba.com/api/api_get_jra_odds.html"
+        f"?pid=api_get_jra_odds&input=UTF-8&output=json&race_id={race_id}&type={odds_type}"
+    )
+
+    candidate_urls = [
+        f"{base_url}&action=init&compress=0",
+        f"{base_url}&action=init&compress=1",
+    ]
+    if odds_type in (4, 5, 6, 7):
+        candidate_urls.extend([
+            f"{base_url}&action=init&housiki=c0&compress=0",
+            f"{base_url}&action=init&housiki=c0&compress=1",
+        ])
+
+    for url in candidate_urls:
+        try:
+            resp = requests.get(url, headers=api_headers, timeout=10)
+            if resp.status_code != 200:
+                continue
+            txt = resp.text.strip()
+            if not txt:
+                continue
+            if not txt.startswith("{") and "(" in txt and txt.endswith(")"):
+                txt = txt[txt.find("(") + 1 : -1].strip()
+            payload = json.loads(txt)
+            raw_data = payload.get("data")
+            if not raw_data:
+                continue
+            data_obj = _decode_odds_data_field(raw_data)
+            odds_dict = data_obj.get("odds", {})
+            if isinstance(odds_dict, dict):
+                target = odds_dict.get(str(odds_type))
+                if isinstance(target, dict) and len(target) > 0:
+                    return target
+        except Exception:
+            continue
+    return {}
 
 
 def _parse_odds_float(val) -> float | None:
     if isinstance(val, list) and val:
         val = val[0]
     try:
-        f = float(str(val).replace(",", "").strip())
+        s = str(val).replace(",", "").strip()
+        if not s or "---" in s or s == "-":
+            return None
+        f = float(s)
         return f if f >= 1.0 else None
     except (ValueError, TypeError):
         return None
 
 
-def _fetch_past_runs(race_id: str) -> dict[int, dict]:
-    """5走前までの過去成績ページ（shutuba_past.html）から各馬番の過去3走着順・前走タイム差を取得する"""
-    past_map: dict[int, dict] = {}
+def _fetch_past_runs(race_id: str) -> tuple[dict[int, dict], dict[str, dict]]:
+    """
+    5走前までの過去成績ページ（shutuba_past.html）から各馬の過去3走着順・前走タイム差を取得する。
+    馬番マップと正規化馬名マップの両方を返し、HTMLクラス変更に左右されず確実に紐付ける。
+    """
+    past_by_num: dict[int, dict] = {}
+    past_by_name: dict[str, dict] = {}
     url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         if resp.status_code != 200:
-            return past_map
-        soup = BeautifulSoup(decode_html(resp), "lxml")
+            return past_by_num, past_by_name
+        soup = _make_soup(decode_html(resp))
         for tr in soup.select("tr.HorseList"):
-            num_el = tr.select_one("td.Waku + td") or tr.select_one("td.Umaban")
-            if not num_el:
-                continue
-            num_txt = num_el.get_text(strip=True)
-            if not num_txt.isdigit():
-                continue
-            h_num = int(num_txt)
+            tds = tr.find_all("td")
+            num_el = (
+                tr.select_one("td[class*='Umaban']")
+                or tr.select_one("td[class*='Num']")
+                or (tds[1] if len(tds) > 1 else None)
+            )
+            h_num = None
+            if num_el:
+                ntxt = re.sub(r"\D", "", num_el.get_text(strip=True))
+                if ntxt.isdigit():
+                    h_num = int(ntxt)
+
+            name_el = tr.select_one("div.Horse02 a") or tr.select_one("span.HorseName a") or tr.select_one("a[href*='/horse/']")
+            h_name_norm = re.sub(r"\s+", "", name_el.get_text(strip=True)) if name_el else ""
 
             ranks = []
             first_tdiff = 0.8
-            past_tds = tr.select("td.Past")
+            past_tds = tr.select("td[class*='Past']")
             for idx_p, ptd in enumerate(past_tds[:3]):
                 r_el = ptd.select_one("span.Num")
-                if r_el and r_el.get_text(strip=True).isdigit():
-                    ranks.append(int(r_el.get_text(strip=True)))
-                else:
-                    ranks.append(7)
+                rk_val = None
+                if r_el:
+                    rt = re.sub(r"\D", "", r_el.get_text(strip=True))
+                    if rt.isdigit():
+                        rk_val = int(rt)
+                if rk_val is None:
+                    d01 = ptd.select_one("div.Data01")
+                    if d01:
+                        d01_s = re.sub(r"\d{4}\.\d{2}\.\d{2}", "", d01.get_text(" ", strip=True))
+                        m_r = re.search(r"\b(\d{1,2})\s*$", d01_s.strip())
+                        if m_r:
+                            rk_val = int(m_r.group(1))
+                ranks.append(rk_val if rk_val is not None else 7)
 
                 if idx_p == 0:
                     data_txt = ptd.get_text(" ", strip=True)
@@ -253,36 +341,60 @@ def _fetch_past_runs(race_id: str) -> dict[int, dict]:
             while len(ranks) < 3:
                 ranks.append(7)
 
-            past_map[h_num] = {
+            info_obj = {
                 "prev1_rank": int(np.clip(ranks[0], 1, 18)),
                 "prev2_rank": int(np.clip(ranks[1], 1, 18)),
                 "prev3_rank": int(np.clip(ranks[2], 1, 18)),
                 "prev1_time_diff": round(float(np.clip(first_tdiff, 0.0, 10.0)), 2),
             }
+            if h_num is not None:
+                past_by_num[h_num] = info_obj
+            if h_name_norm:
+                past_by_name[h_name_norm] = info_obj
     except Exception:
         pass
-    return past_map
+    return past_by_num, past_by_name
 
 
 def _fetch_confirmed_win_odds_from_result(race_id: str) -> dict[int, float]:
-    """確定済みレースの場合、結果ページから確定単勝オッズを取得する"""
+    """確定済みレースの場合、結果ページ（race.netkeiba / db.netkeiba）から確定単勝オッズを取得する"""
     win_map: dict[int, float] = {}
     try:
         url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         resp = requests.get(url, headers=HEADERS, timeout=12)
-        if resp.status_code != 200:
-            return win_map
-        soup = BeautifulSoup(decode_html(resp), "lxml")
-        for tr in soup.select("table#All_Result_Table tr.HorseList"):
-            num_el = tr.select_one("td.Num.Txt_C div") or tr.select_one("td:nth-of-type(3)")
-            odds_el = tr.select_one("td.Odds.Txt_R span") or tr.select_one("td.Odds")
-            if num_el and odds_el:
-                n_txt = num_el.get_text(strip=True)
-                o_val = _parse_odds_float(odds_el.get_text(strip=True))
-                if n_txt.isdigit() and o_val is not None:
-                    win_map[int(n_txt)] = o_val
+        if resp.status_code == 200:
+            soup = _make_soup(decode_html(resp))
+            for tr in soup.select("table#All_Result_Table tr.HorseList"):
+                num_el = tr.select_one("td.Num.Txt_C div") or tr.select_one("td:nth-of-type(3)")
+                odds_el = tr.select_one("td.Odds.Txt_R span") or tr.select_one("td.Odds")
+                if num_el and odds_el:
+                    n_txt = num_el.get_text(strip=True)
+                    o_val = _parse_odds_float(odds_el.get_text(strip=True))
+                    if n_txt.isdigit() and o_val is not None:
+                        win_map[int(n_txt)] = o_val
     except Exception:
         pass
+
+    if win_map:
+        return win_map
+
+    try:
+        db_url = f"https://db.netkeiba.com/race/{race_id}/"
+        resp_db = requests.get(db_url, headers=HEADERS, timeout=12)
+        if resp_db.status_code == 200:
+            soup_db = _make_soup(decode_html(resp_db))
+            tbl = soup_db.find("table", class_="race_table_01")
+            if tbl:
+                for tr in tbl.find_all("tr")[1:]:
+                    tds = tr.find_all("td")
+                    if len(tds) > 12:
+                        n_txt = tds[2].get_text(strip=True)
+                        o_val = _parse_odds_float(tds[12].get_text(strip=True))
+                        if n_txt.isdigit() and o_val is not None:
+                            win_map[int(n_txt)] = o_val
+    except Exception:
+        pass
+
     return win_map
 
 
@@ -291,13 +403,12 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
     url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(decode_html(resp), "lxml")
+    soup = _make_soup(decode_html(resp))
 
     venue = JRA_VENUE_CODE.get(race_id[4:6], "東京")
     race_num = int(race_id[10:12])
     race_title = _extract_race_title(soup, venue, race_num)
 
-    # レース条件（発走時刻・芝ダ・距離・馬場状態）
     rd01 = soup.select_one("div.RaceData01")
     rd01_txt = rd01.get_text(" ", strip=True) if rd01 else ""
 
@@ -315,8 +426,7 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
     else:
         track_condition = "良"
 
-    # 過去走データ取得
-    past_map = _fetch_past_runs(race_id)
+    past_by_num, past_by_name = _fetch_past_runs(race_id)
 
     # 全券種オッズAPI取得
     win_api = _fetch_jra_odds_api(race_id, 1)
@@ -327,15 +437,15 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
 
     win_odds_map: dict[int, float] = {}
     for k, v in win_api.items():
-        if str(k).isdigit():
+        digits = re.sub(r"\D", "", str(k))
+        if digits:
             ov = _parse_odds_float(v)
             if ov is not None:
-                win_odds_map[int(k)] = ov
+                win_odds_map[int(digits)] = ov
 
     if not win_odds_map:
         win_odds_map = _fetch_confirmed_win_odds_from_result(race_id)
 
-    # 出走馬テーブルのパース
     rows = []
     for tr in soup.select("tr.HorseList"):
         if "Cancel" in tr.get("class", []):
@@ -355,6 +465,7 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
 
         name_el = tr.select_one("span.HorseName a") or tr.select_one("span.HorseName")
         horse_name = name_el.get_text(strip=True) if name_el else f"馬番{horse_num}"
+        horse_name_norm = re.sub(r"\s+", "", horse_name)
 
         jockey_el = tr.select_one("td.Jockey a") or tr.select_one("td.Jockey")
         jockey_id = re.sub(r"\s+", "", jockey_el.get_text(strip=True)) if jockey_el else "UNKNOWN_J"
@@ -362,7 +473,6 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
         trainer_el = tr.select_one("td.Trainer a") or tr.select_one("td.Trainer")
         trainer_id = re.sub(r"\s+", "", trainer_el.get_text(strip=True)) if trainer_el else "UNKNOWN_T"
 
-        # 斤量
         kinryo = 56.0
         for td in tr.select("td.Txt_C"):
             t_val = td.get_text(strip=True)
@@ -370,7 +480,6 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
                 kinryo = float(t_val)
                 break
 
-        # 馬体重・増減
         w_el = tr.select_one("td.Weight")
         w_txt = w_el.get_text(strip=True) if w_el else ""
         wm = re.match(r"^(\d{3})\s*\(([+-]?\d+)\)", w_txt)
@@ -380,16 +489,16 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
         else:
             horse_weight, weight_diff = 476, 0
 
-        # 単勝オッズ
         w_odds = win_odds_map.get(horse_num)
         if w_odds is None:
             o_el = tr.select_one("td.Popular span") or tr.select_one("td.Txt_R.Popular")
             if o_el:
                 w_odds = _parse_odds_float(o_el.get_text(strip=True))
 
-        past_info = past_map.get(
-            horse_num,
-            {"prev1_rank": 7, "prev2_rank": 7, "prev3_rank": 7, "prev1_time_diff": 0.8},
+        past_info = (
+            past_by_name.get(horse_name_norm)
+            or past_by_num.get(horse_num)
+            or {"prev1_rank": 7, "prev2_rank": 7, "prev3_rank": 7, "prev1_time_diff": 0.8}
         )
 
         rows.append({
@@ -434,16 +543,18 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
     # 馬連・ワイドオッズDF構築
     pair_records = {}
     for k, v in umaren_api.items():
-        if len(str(k)) == 4 and str(k).isdigit():
-            h1, h2 = int(k[:2]), int(k[2:])
+        d = re.sub(r"\D", "", str(k))
+        if len(d) == 4:
+            h1, h2 = int(d[:2]), int(d[2:])
             key = (min(h1, h2), max(h1, h2))
             ov = _parse_odds_float(v)
             if ov is not None:
                 pair_records.setdefault(key, {"horse_num_1": key[0], "horse_num_2": key[1]})["umaren_odds"] = ov
 
     for k, v in wide_api.items():
-        if len(str(k)) == 4 and str(k).isdigit():
-            h1, h2 = int(k[:2]), int(k[2:])
+        d = re.sub(r"\D", "", str(k))
+        if len(d) == 4:
+            h1, h2 = int(d[:2]), int(d[2:])
             key = (min(h1, h2), max(h1, h2))
             ov = _parse_odds_float(v)
             if ov is not None:
@@ -454,22 +565,24 @@ def fetch_shutuba_and_odds(race_id: str, date_str: str) -> dict:
     # 馬単オッズDF構築
     exacta_rows = []
     for k, v in exacta_api.items():
-        if len(str(k)) == 4 and str(k).isdigit():
+        d = re.sub(r"\D", "", str(k))
+        if len(d) == 4:
             ov = _parse_odds_float(v)
             if ov is not None:
-                exacta_rows.append({"horse_num_1": int(k[:2]), "horse_num_2": int(k[2:]), "exacta_odds": ov})
+                exacta_rows.append({"horse_num_1": int(d[:2]), "horse_num_2": int(d[2:]), "exacta_odds": ov})
     exacta_odds_df = pd.DataFrame(exacta_rows) if exacta_rows else None
 
     # 三連複オッズDF構築
     trio_rows = []
     for k, v in trio_api.items():
-        if len(str(k)) == 6 and str(k).isdigit():
+        d = re.sub(r"\D", "", str(k))
+        if len(d) == 6:
             ov = _parse_odds_float(v)
             if ov is not None:
                 trio_rows.append({
-                    "horse_num_1": int(k[:2]),
-                    "horse_num_2": int(k[2:4]),
-                    "horse_num_3": int(k[4:6]),
+                    "horse_num_1": int(d[:2]),
+                    "horse_num_2": int(d[2:4]),
+                    "horse_num_3": int(d[4:6]),
                     "trio_odds": ov,
                 })
     trio_odds_df = pd.DataFrame(trio_rows) if trio_rows else None

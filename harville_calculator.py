@@ -334,7 +334,7 @@ def build_budget_mode_tickets(
     if style_mode == "upset":
         rem_allowed.sort(key=lambda h: (prob_map[h] / 100.0) * min(odds_map[h], 50.0), reverse=True)
 
-    followers_list = (rem_marks + rem_allowed + rem_others)[:5]
+    followers_list = sorted((rem_marks + rem_allowed + rem_others)[:5])
 
     # 三連複 2頭軸5頭流し（5点）テーブル構築
     trio_lookup = {}
