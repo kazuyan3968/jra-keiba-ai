@@ -1,10 +1,14 @@
 import os
 import re
 import joblib
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss, roc_auc_score
+
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
 
 CATEGORICAL_COLS = ["venue", "surface", "track_condition"]
 
@@ -42,15 +46,169 @@ FEATURE_COLS = [
 ]
 
 
+class PureLGBMBooster:
+    """
+    lightgbm パッケージが無い環境（Streamlit Cloud等）でも、
+    model_to_string() のテキストから LightGBM の二分木推論を再現する純粋 NumPy エンジン。
+    """
+
+    def __init__(self, model_str: str):
+        self.trees = []
+        self.sigmoid = 1.0
+        self._parse_model_str(model_str)
+
+    def _parse_model_str(self, model_str: str):
+        lines = model_str.splitlines()
+        cur_tree = None
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("objective="):
+                m_sig = re.search(r"sigmoid:([0-9eE.+-]+)", line)
+                if m_sig:
+                    self.sigmoid = float(m_sig.group(1))
+            elif line.startswith("Tree="):
+                if cur_tree is not None:
+                    self.trees.append(self._finalize_tree(cur_tree))
+                cur_tree = {}
+            elif line == "end of trees":
+                if cur_tree is not None:
+                    self.trees.append(self._finalize_tree(cur_tree))
+                    cur_tree = None
+            elif cur_tree is not None and "=" in line:
+                k, v = line.split("=", 1)
+                cur_tree[k] = v.strip()
+
+        if cur_tree is not None:
+            self.trees.append(self._finalize_tree(cur_tree))
+
+    @staticmethod
+    def _finalize_tree(t: dict) -> dict:
+        num_leaves = int(t.get("num_leaves", 1))
+        leaf_value = np.fromstring(t.get("leaf_value", "0.0"), sep=" ", dtype=np.float64)
+        if num_leaves <= 1 or "split_feature" not in t or not t["split_feature"]:
+            return {"num_leaves": 1, "leaf_value": leaf_value}
+
+        split_feature = np.fromstring(t["split_feature"], sep=" ", dtype=np.int32)
+        threshold = np.fromstring(t["threshold"], sep=" ", dtype=np.float64)
+        decision_type = np.fromstring(t["decision_type"], sep=" ", dtype=np.int32)
+        left_child = np.fromstring(t["left_child"], sep=" ", dtype=np.int32)
+        right_child = np.fromstring(t["right_child"], sep=" ", dtype=np.int32)
+        cat_boundaries = (
+            np.fromstring(t["cat_boundaries"], sep=" ", dtype=np.int32)
+            if "cat_boundaries" in t and t["cat_boundaries"]
+            else np.array([], dtype=np.int32)
+        )
+        cat_threshold = (
+            np.fromstring(t["cat_threshold"], sep=" ", dtype=np.uint32)
+            if "cat_threshold" in t and t["cat_threshold"]
+            else np.array([], dtype=np.uint32)
+        )
+        return {
+            "num_leaves": num_leaves,
+            "split_feature": split_feature,
+            "threshold": threshold,
+            "decision_type": decision_type,
+            "left_child": left_child,
+            "right_child": right_child,
+            "leaf_value": leaf_value,
+            "cat_boundaries": cat_boundaries,
+            "cat_threshold": cat_threshold,
+        }
+
+    def predict(self, X) -> np.ndarray:
+        if isinstance(X, pd.DataFrame):
+            cols_arr = []
+            cat_flags = []
+            for col in X.columns:
+                s = X[col]
+                if isinstance(s.dtype, pd.CategoricalDtype):
+                    cols_arr.append(s.cat.codes.to_numpy(dtype=np.float64))
+                    cat_flags.append(True)
+                else:
+                    cols_arr.append(pd.to_numeric(s, errors="coerce").to_numpy(dtype=np.float64))
+                    cat_flags.append(False)
+            X_mat = np.column_stack(cols_arr) if cols_arr else np.zeros((len(X), 0), dtype=np.float64)
+        else:
+            X_mat = np.asarray(X, dtype=np.float64)
+            cat_flags = [False] * X_mat.shape[1]
+
+        n_samples = X_mat.shape[0]
+        raw_scores = np.zeros(n_samples, dtype=np.float64)
+
+        for tree in self.trees:
+            if tree["num_leaves"] <= 1:
+                raw_scores += float(tree["leaf_value"][0])
+                continue
+
+            sf = tree["split_feature"]
+            th = tree["threshold"]
+            dt = tree["decision_type"]
+            lc = tree["left_child"]
+            rc = tree["right_child"]
+            lv = tree["leaf_value"]
+            cb = tree["cat_boundaries"]
+            ct = tree["cat_threshold"]
+
+            for i in range(n_samples):
+                node = 0
+                while node >= 0:
+                    f_idx = int(sf[node])
+                    val = X_mat[i, f_idx]
+                    d_type = int(dt[node])
+                    is_cat = (d_type & 1) == 1
+                    default_left = (d_type & 2) != 0
+                    missing_type = (d_type >> 2) & 3
+
+                    if is_cat or cat_flags[f_idx]:
+                        c_code = -1 if np.isnan(val) else int(val)
+                        if missing_type == 0 and c_code < 0:
+                            c_code = 0
+                        is_missing = (c_code < 0) or (missing_type == 1 and c_code == 0)
+                        if is_missing:
+                            node = int(lc[node]) if default_left else int(rc[node])
+                        else:
+                            cat_idx = int(round(th[node]))
+                            st_i = int(cb[cat_idx])
+                            ed_i = int(cb[cat_idx + 1])
+                            w_i = c_code >> 5
+                            b_i = c_code & 31
+                            in_set = (0 <= w_i < (ed_i - st_i)) and ((int(ct[st_i + w_i]) & (1 << b_i)) != 0)
+                            node = int(lc[node]) if in_set else int(rc[node])
+                    else:
+                        if missing_type == 0:
+                            v_num = 0.0 if np.isnan(val) else val
+                            is_missing = False
+                        elif missing_type == 1:
+                            is_missing = np.isnan(val) or (val == 0.0)
+                            v_num = val
+                        else:
+                            is_missing = np.isnan(val)
+                            v_num = val
+
+                        if is_missing:
+                            node = int(lc[node]) if default_left else int(rc[node])
+                        else:
+                            node = int(lc[node]) if v_num <= th[node] else int(rc[node])
+
+                raw_scores[i] += float(lv[~node])
+
+        return 1.0 / (1.0 + np.exp(-self.sigmoid * raw_scores))
+
+
 class BoosterBinaryWrapper:
     """
-    OS・Pythonバージョン・scikit-learnバージョン非依存の lightgbm.Booster 文字列から
-    predict_proba を提供する軽量ラッパー。
+    lightgbm.Booster テキストから predict_proba を提供するラッパー。
+    lightgbm が導入済みの環境ではネイティブ Booster を、未導入環境では PureLGBMBooster を自動選択する。
     """
 
     def __init__(self, booster_str: str):
         self.booster_str = str(booster_str)
-        self._booster = lgb.Booster(model_str=self.booster_str)
+        if lgb is not None:
+            self._booster = lgb.Booster(model_str=self.booster_str)
+        else:
+            self._booster = PureLGBMBooster(self.booster_str)
 
     def predict_proba(self, X) -> np.ndarray:
         p1 = np.asarray(self._booster.predict(X), dtype=float).reshape(-1)
@@ -439,6 +597,9 @@ def predict_calibrated_win_probs(race_df: pd.DataFrame, artifact: dict) -> np.nd
 
 
 def main():
+    if lgb is None:
+        raise ImportError("学習を実行するには lightgbm のインストールが必要です (pip install lightgbm)。")
+
     hist_path = os.path.join("data", "historical_races.csv")
     if not os.path.exists(hist_path):
         raise FileNotFoundError(f"{hist_path} が見つかりません。先に 05_scrape_history.py でデータを収集してください。")
@@ -532,7 +693,6 @@ def main():
     print(f"キャリブレーション: temperature={cal_params['temperature']}, tail_alpha={cal_params['tail_alpha']}")
     print(f"未知レース後半（{len(eval_rids):,}R）LogLoss: 補正前 {ll_naive:.4f} -> 補正後 {ll_cal:.4f}")
 
-    # OS・Python・scikit-learnバージョン非依存の純粋テキスト形式で保存
     booster_str = str(model.booster_.model_to_string())
     os.makedirs("models", exist_ok=True)
     artifact = {
