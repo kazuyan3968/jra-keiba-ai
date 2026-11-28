@@ -1,375 +1,284 @@
-from collections import Counter
-from itertools import combinations, permutations, product
+import itertools
 import numpy as np
 import pandas as pd
 
 
-def compute_harville_tensor(win_probs: np.ndarray) -> np.ndarray:
-    """単勝確率ベクトルから 1着・2着・3着の全順列確率テンソル P(i, j, k) を算出する"""
-    p = np.asarray(win_probs, dtype=np.float64)
-    p = np.clip(p, 1e-6, 1.0 - 1e-6)
+def calculate_horse_place_probs(race_df: pd.DataFrame, prob_col: str = "win_prob") -> pd.DataFrame:
+    """
+    ハービル公式により各馬の単勝率・連対率(2着以内)・複勝率(3着以内)を算出する。
+    """
+    df = race_df.copy()
+    p = np.clip(pd.to_numeric(df[prob_col], errors="coerce").fillna(1e-5).to_numpy(dtype=float), 1e-6, 1.0)
     p = p / p.sum()
-
     n = len(p)
-    p1 = p[:, None, None]
-    p2 = p[None, :, None]
-    p3 = p[None, None, :]
 
-    denom1 = np.maximum(1.0 - p1, 1e-9)
-    denom2 = np.maximum(1.0 - p1 - p2, 1e-9)
+    quinella = p.copy()
+    place = p.copy()
 
-    idx = np.arange(n)
-    i_idx, j_idx, k_idx = np.meshgrid(idx, idx, idx, indexing="ij")
-    valid = (i_idx != j_idx) & (i_idx != k_idx) & (j_idx != k_idx)
+    if n >= 2:
+        for j in range(n):
+            p2 = 0.0
+            for i in range(n):
+                if i == j:
+                    continue
+                d1 = max(1e-6, 1.0 - p[i])
+                p2 += p[i] * (p[j] / d1)
+            quinella[j] = p[j] + p2
 
-    tensor = np.where(valid, p1 * (p2 / denom1) * (p3 / denom2), 0.0)
-    return tensor
+    if n >= 3:
+        for k in range(n):
+            p3 = 0.0
+            for i in range(n):
+                if i == k:
+                    continue
+                d1 = max(1e-6, 1.0 - p[i])
+                for j in range(n):
+                    if j == i or j == k:
+                        continue
+                    d2 = max(1e-6, 1.0 - p[i] - p[j])
+                    p3 += p[i] * (p[j] / d1) * (p[k] / d2)
+            place[k] = quinella[k] + p3
+    else:
+        place = quinella.copy()
+
+    df["pred_win_pct"] = (p * 100.0).round(2)
+    df["pred_quinella_pct"] = (np.clip(quinella, 0.0, 0.999) * 100.0).round(2)
+    df["pred_place_pct"] = (np.clip(place, 0.0, 0.999) * 100.0).round(2)
+    return df
 
 
-def calculate_horse_place_probs(df: pd.DataFrame, prob_col: str = "win_prob") -> pd.DataFrame:
-    """各馬の連対率（2着以内）および3着内率（複勝圏内）をデータフレームに付与する"""
-    out = df.copy()
-    tensor = compute_harville_tensor(out[prob_col].to_numpy())
-
-    p_1st = tensor.sum(axis=(1, 2))
-    p_2nd = tensor.sum(axis=(0, 2))
-    p_3rd = tensor.sum(axis=(0, 1))
-
-    out["pred_win_pct"] = p_1st * 100.0
-    out["pred_quinella_pct"] = (p_1st + p_2nd) * 100.0
-    out["pred_place_pct"] = (p_1st + p_2nd + p_3rd) * 100.0
-    return out
+def _build_market_probs(df: pd.DataFrame) -> dict[int, float]:
+    nums = df["horse_num"].astype(int).tolist()
+    odds = np.clip(pd.to_numeric(df["win_odds"], errors="coerce").fillna(25.0).to_numpy(dtype=float), 1.05, 999.9)
+    raw = 1.0 / odds
+    q = raw / raw.sum()
+    return dict(zip(nums, q))
 
 
 def calculate_pair_probabilities(
-    df: pd.DataFrame,
+    race_df: pd.DataFrame,
     prob_col: str = "win_prob",
     pair_odds_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """全馬番ペアの馬連・ワイド的中確率と期待値（EV）を算出する"""
-    horses = df.reset_index(drop=True)
-    tensor = compute_harville_tensor(horses[prob_col].to_numpy())
+    """全組合せの馬連・ワイド確率および実オッズ（未取得時は合成オッズ）期待値を算出する"""
+    df = race_df.sort_values("horse_num").reset_index(drop=True)
+    nums = df["horse_num"].astype(int).tolist()
+    names = dict(zip(nums, df["horse_name"].astype(str)))
+    p_arr = np.clip(pd.to_numeric(df[prob_col], errors="coerce").fillna(1e-5).to_numpy(dtype=float), 1e-6, 1.0)
+    p_arr = p_arr / p_arr.sum()
+    p_map = dict(zip(nums, p_arr))
+    q_map = _build_market_probs(df)
 
-    mkt_raw = 0.80 / np.clip(horses["win_odds"].to_numpy(), 1.1, 500.0)
-    mkt_tensor = compute_harville_tensor(mkt_raw / mkt_raw.sum())
-    rng = np.random.default_rng(42)
+    umaren_real = {}
+    wide_real = {}
+    if pair_odds_df is not None and not pair_odds_df.empty:
+        for _, r in pair_odds_df.iterrows():
+            h1, h2 = int(r["horse_num_1"]), int(r["horse_num_2"])
+            k = (min(h1, h2), max(h1, h2))
+            if "umaren_odds" in r and pd.notna(r["umaren_odds"]):
+                umaren_real[k] = float(r["umaren_odds"])
+            if "wide_odds" in r and pd.notna(r["wide_odds"]):
+                wide_real[k] = float(r["wide_odds"])
 
-    records = []
-    n = len(horses)
-    for i, j in combinations(range(n), 2):
-        p_umaren = tensor[i, j, :].sum() + tensor[j, i, :].sum()
-        p_wide = (
-            tensor[i, j, :].sum()
-            + tensor[j, i, :].sum()
-            + tensor[i, :, j].sum()
-            + tensor[j, :, i].sum()
-            + tensor[:, i, j].sum()
-            + tensor[:, j, i].sum()
-        )
+    rows = []
+    for h1, h2 in itertools.combinations(nums, 2):
+        p1, p2 = p_map[h1], p_map[h2]
+        p_umaren = p1 * (p2 / max(1e-6, 1.0 - p1)) + p2 * (p1 / max(1e-6, 1.0 - p2))
 
-        mkt_p_umaren = mkt_tensor[i, j, :].sum() + mkt_tensor[j, i, :].sum()
-        mkt_p_wide = (
-            mkt_tensor[i, j, :].sum()
-            + mkt_tensor[j, i, :].sum()
-            + mkt_tensor[i, :, j].sum()
-            + mkt_tensor[j, :, i].sum()
-            + mkt_tensor[:, i, j].sum()
-            + mkt_tensor[:, j, i].sum()
-        )
-        noise_u = rng.uniform(0.90, 1.12)
-        noise_w = rng.uniform(0.92, 1.10)
-        est_umaren_odds = round(float(np.clip((0.775 / max(mkt_p_umaren, 1e-5)) * noise_u, 1.5, 999.9)), 1)
-        est_wide_odds = round(float(np.clip((0.775 / max(mkt_p_wide, 1e-5)) * noise_w, 1.1, 300.0)), 1)
+        p_wide = p_umaren
+        for h3 in nums:
+            if h3 == h1 or h3 == h2:
+                continue
+            p3 = p_map[h3]
+            d3 = max(1e-6, 1.0 - p3)
+            p_wide += p3 * (p1 / d3) * (p2 / max(1e-6, d3 - p1))
+            p_wide += p3 * (p2 / d3) * (p1 / max(1e-6, d3 - p2))
+            d1 = max(1e-6, 1.0 - p1)
+            p_wide += p1 * (p3 / d1) * (p2 / max(1e-6, d1 - p3))
+            d2 = max(1e-6, 1.0 - p2)
+            p_wide += p2 * (p3 / d2) * (p1 / max(1e-6, d2 - p3))
 
-        h1_num = int(horses.loc[i, "horse_num"])
-        h2_num = int(horses.loc[j, "horse_num"])
-        if h1_num > h2_num:
-            h1_num, h2_num = h2_num, h1_num
-            h1_name, h2_name = horses.loc[j, "horse_name"], horses.loc[i, "horse_name"]
+        k = (h1, h2)
+        if k in umaren_real:
+            o_u = umaren_real[k]
         else:
-            h1_name, h2_name = horses.loc[i, "horse_name"], horses.loc[j, "horse_name"]
+            q1, q2 = q_map[h1], q_map[h2]
+            qu = q1 * (q2 / max(1e-6, 1.0 - q1)) + q2 * (q1 / max(1e-6, 1.0 - q2))
+            o_u = round(float(np.clip(0.775 / max(1e-6, qu), 1.4, 999.9)), 1)
 
-        records.append({
-            "h1": h1_num,
-            "h2": h2_num,
-            "組み合わせ": f"{h1_num:02d} - {h2_num:02d}",
-            "馬名ペア": f"{h1_name} × {h2_name}",
-            "馬連的中率(%)": p_umaren * 100.0,
-            "ワイド的中率(%)": p_wide * 100.0,
-            "馬連オッズ": est_umaren_odds,
-            "ワイドオッズ": est_wide_odds,
+        if k in wide_real:
+            o_w = wide_real[k]
+        else:
+            o_w = round(float(np.clip(o_u * 0.36, 1.1, 300.0)), 1)
+
+        rows.append({
+            "horse_num_1": h1,
+            "horse_num_2": h2,
+            "組み合わせ": f"{h1:02d} - {h2:02d}",
+            "馬名ペア": f"{names[h1]} × {names[h2]}",
+            "馬連オッズ": o_u,
+            "馬連的中率(%)": round(p_umaren * 100.0, 2),
+            "馬連期待値(EV)": round(p_umaren * o_u, 2),
+            "ワイドオッズ": o_w,
+            "ワイド的中率(%)": round(min(p_wide, 0.99) * 100.0, 2),
+            "ワイド期待値(EV)": round(min(p_wide, 0.99) * o_w, 2),
         })
 
-    pairs_df = pd.DataFrame(records)
-
-    if pair_odds_df is not None and not pair_odds_df.empty:
-        odds_clean = pair_odds_df.copy()
-        odds_clean["h1"] = odds_clean[["horse_num_1", "horse_num_2"]].min(axis=1).astype(int)
-        odds_clean["h2"] = odds_clean[["horse_num_1", "horse_num_2"]].max(axis=1).astype(int)
-        merge_cols = ["h1", "h2"]
-        if "umaren_odds" in odds_clean.columns:
-            merge_cols.append("umaren_odds")
-        if "wide_odds" in odds_clean.columns:
-            merge_cols.append("wide_odds")
-
-        pairs_df = pairs_df.merge(odds_clean[merge_cols], on=["h1", "h2"], how="left")
-        if "umaren_odds" in pairs_df.columns:
-            pairs_df["馬連オッズ"] = pairs_df["umaren_odds"].fillna(pairs_df["馬連オッズ"])
-            pairs_df.drop(columns=["umaren_odds"], inplace=True)
-        if "wide_odds" in pairs_df.columns:
-            pairs_df["ワイドオッズ"] = pairs_df["wide_odds"].fillna(pairs_df["ワイドオッズ"])
-            pairs_df.drop(columns=["wide_odds"], inplace=True)
-
-    pairs_df["馬連期待値(EV)"] = (pairs_df["馬連的中率(%)"] / 100.0) * pairs_df["馬連オッズ"]
-    pairs_df["ワイド期待値(EV)"] = (pairs_df["ワイド的中率(%)"] / 100.0) * pairs_df["ワイドオッズ"]
-
-    return pairs_df
+    return pd.DataFrame(rows)
 
 
 def calculate_exacta_probabilities(
-    df: pd.DataFrame,
+    race_df: pd.DataFrame,
     prob_col: str = "win_prob",
     exacta_odds_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """全順列（nP2）の馬単的中確率と期待値（EV）を算出する"""
-    horses = df.reset_index(drop=True)
-    tensor = compute_harville_tensor(horses[prob_col].to_numpy())
+    """全組合せの馬単確率・期待値を算出する"""
+    df = race_df.sort_values("horse_num").reset_index(drop=True)
+    nums = df["horse_num"].astype(int).tolist()
+    names = dict(zip(nums, df["horse_name"].astype(str)))
+    p_arr = np.clip(pd.to_numeric(df[prob_col], errors="coerce").fillna(1e-5).to_numpy(dtype=float), 1e-6, 1.0)
+    p_arr = p_arr / p_arr.sum()
+    p_map = dict(zip(nums, p_arr))
+    q_map = _build_market_probs(df)
 
-    mkt_raw = 0.80 / np.clip(horses["win_odds"].to_numpy(), 1.1, 500.0)
-    mkt_tensor = compute_harville_tensor(mkt_raw / mkt_raw.sum())
-    rng = np.random.default_rng(77)
+    exacta_real = {}
+    if exacta_odds_df is not None and not exacta_odds_df.empty:
+        for _, r in exacta_odds_df.iterrows():
+            k = (int(r["horse_num_1"]), int(r["horse_num_2"]))
+            if "exacta_odds" in r and pd.notna(r["exacta_odds"]):
+                exacta_real[k] = float(r["exacta_odds"])
 
-    records = []
-    n = len(horses)
-    for i, j in permutations(range(n), 2):
-        p_exacta = tensor[i, j, :].sum()
-        mkt_p_exacta = mkt_tensor[i, j, :].sum()
-        noise_e = rng.uniform(0.88, 1.14)
-        est_exacta_odds = round(float(np.clip((0.750 / max(mkt_p_exacta, 1e-5)) * noise_e, 2.0, 1999.9)), 1)
+    rows = []
+    for h1, h2 in itertools.permutations(nums, 2):
+        p1, p2 = p_map[h1], p_map[h2]
+        p_ex = p1 * (p2 / max(1e-6, 1.0 - p1))
+        k = (h1, h2)
+        if k in exacta_real:
+            o_ex = exacta_real[k]
+        else:
+            q1, q2 = q_map[h1], q_map[h2]
+            q_ex = q1 * (q2 / max(1e-6, 1.0 - q1))
+            o_ex = round(float(np.clip(0.75 / max(1e-6, q_ex), 1.8, 1999.9)), 1)
 
-        h1_num = int(horses.loc[i, "horse_num"])
-        h2_num = int(horses.loc[j, "horse_num"])
-        h1_name = str(horses.loc[i, "horse_name"])
-        h2_name = str(horses.loc[j, "horse_name"])
-
-        records.append({
-            "h1": h1_num,
-            "h2": h2_num,
-            "組み合わせ": f"{h1_num:02d} → {h2_num:02d}",
-            "馬名順列": f"{h1_name} → {h2_name}",
-            "馬単的中率(%)": p_exacta * 100.0,
-            "馬単オッズ": est_exacta_odds,
+        rows.append({
+            "horse_num_1": h1,
+            "horse_num_2": h2,
+            "組み合わせ": f"{h1:02d} → {h2:02d}",
+            "馬名順列": f"{names[h1]} → {names[h2]}",
+            "馬単オッズ": o_ex,
+            "馬単的中率(%)": round(p_ex * 100.0, 2),
+            "馬単期待値(EV)": round(p_ex * o_ex, 2),
         })
 
-    exacta_df = pd.DataFrame(records)
-
-    if exacta_odds_df is not None and not exacta_odds_df.empty and "exacta_odds" in exacta_odds_df.columns:
-        odds_clean = exacta_odds_df.copy()
-        odds_clean["h1"] = odds_clean["horse_num_1"].astype(int)
-        odds_clean["h2"] = odds_clean["horse_num_2"].astype(int)
-        exacta_df = exacta_df.merge(odds_clean[["h1", "h2", "exacta_odds"]], on=["h1", "h2"], how="left")
-        exacta_df["馬単オッズ"] = exacta_df["exacta_odds"].fillna(exacta_df["馬単オッズ"])
-        exacta_df.drop(columns=["exacta_odds"], inplace=True)
-
-    exacta_df["馬単期待値(EV)"] = (exacta_df["馬単的中率(%)"] / 100.0) * exacta_df["馬単オッズ"]
-    return exacta_df
+    return pd.DataFrame(rows)
 
 
 def calculate_trio_probabilities(
-    df: pd.DataFrame,
+    race_df: pd.DataFrame,
     prob_col: str = "win_prob",
     trio_odds_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """全3頭組み合わせ（nC3）の三連複的中確率と期待値（EV）を算出する"""
-    horses = df.reset_index(drop=True)
-    tensor = compute_harville_tensor(horses[prob_col].to_numpy())
+    """上位10頭の三連複組合せ確率・期待値を算出する"""
+    df_all = race_df.sort_values("horse_num").reset_index(drop=True)
+    nums_all = df_all["horse_num"].astype(int).tolist()
+    names = dict(zip(nums_all, df_all["horse_name"].astype(str)))
+    p_arr = np.clip(pd.to_numeric(df_all[prob_col], errors="coerce").fillna(1e-5).to_numpy(dtype=float), 1e-6, 1.0)
+    p_arr = p_arr / p_arr.sum()
+    p_map = dict(zip(nums_all, p_arr))
+    q_map = _build_market_probs(df_all)
 
-    mkt_raw = 0.80 / np.clip(horses["win_odds"].to_numpy(), 1.1, 500.0)
-    mkt_tensor = compute_harville_tensor(mkt_raw / mkt_raw.sum())
-    rng = np.random.default_rng(108)
+    df_all["_p"] = p_arr
+    top_nums = sorted(df_all.sort_values("_p", ascending=False)["horse_num"].astype(int).head(10).tolist())
 
-    records = []
-    n = len(horses)
-    for i, j, k in combinations(range(n), 3):
-        p_trio = (
-            tensor[i, j, k]
-            + tensor[i, k, j]
-            + tensor[j, i, k]
-            + tensor[j, k, i]
-            + tensor[k, i, j]
-            + tensor[k, j, i]
-        )
-        mkt_p_trio = (
-            mkt_tensor[i, j, k]
-            + mkt_tensor[i, k, j]
-            + mkt_tensor[j, i, k]
-            + mkt_tensor[j, k, i]
-            + mkt_tensor[k, i, j]
-            + mkt_tensor[k, j, i]
-        )
+    trio_real = {}
+    if trio_odds_df is not None and not trio_odds_df.empty:
+        for _, r in trio_odds_df.iterrows():
+            k = tuple(sorted([int(r["horse_num_1"]), int(r["horse_num_2"]), int(r["horse_num_3"])]))
+            if "trio_odds" in r and pd.notna(r["trio_odds"]):
+                trio_real[k] = float(r["trio_odds"])
 
-        noise_t = rng.uniform(0.88, 1.18)
-        est_trio_odds = round(float(np.clip((0.750 / max(mkt_p_trio, 1e-6)) * noise_t, 3.0, 4999.9)), 1)
+    rows = []
+    for h1, h2, h3 in itertools.combinations(top_nums, 3):
+        p_trio = 0.0
+        for a, b, c in itertools.permutations((h1, h2, h3)):
+            pa, pb, pc = p_map[a], p_map[b], p_map[c]
+            p_trio += pa * (pb / max(1e-6, 1.0 - pa)) * (pc / max(1e-6, 1.0 - pa - pb))
 
-        items = sorted(
-            [
-                (int(horses.loc[i, "horse_num"]), str(horses.loc[i, "horse_name"])),
-                (int(horses.loc[j, "horse_num"]), str(horses.loc[j, "horse_name"])),
-                (int(horses.loc[k, "horse_num"]), str(horses.loc[k, "horse_name"])),
-            ],
-            key=lambda x: x[0],
-        )
-        (h1, n1), (h2, n2), (h3, n3) = items
+        k = (h1, h2, h3)
+        if k in trio_real:
+            o_trio = trio_real[k]
+        else:
+            q_trio = 0.0
+            for a, b, c in itertools.permutations((h1, h2, h3)):
+                qa, qb, qc = q_map[a], q_map[b], q_map[c]
+                q_trio += qa * (qb / max(1e-6, 1.0 - qa)) * (qc / max(1e-6, 1.0 - qa - qb))
+            o_trio = round(float(np.clip(0.75 / max(1e-6, q_trio), 2.5, 4999.9)), 1)
 
-        records.append({
-            "h1": h1,
-            "h2": h2,
-            "h3": h3,
+        rows.append({
+            "horse_num_1": h1,
+            "horse_num_2": h2,
+            "horse_num_3": h3,
             "組み合わせ": f"{h1:02d} - {h2:02d} - {h3:02d}",
-            "馬名トリオ": f"{n1} × {n2} × {n3}",
-            "三連複的中率(%)": p_trio * 100.0,
-            "三連複オッズ": est_trio_odds,
+            "馬名トリオ": f"{names[h1]} × {names[h2]} × {names[h3]}",
+            "三連複オッズ": o_trio,
+            "三連複的中率(%)": round(p_trio * 100.0, 2),
+            "三連複期待値(EV)": round(p_trio * o_trio, 2),
         })
 
-    trio_df = pd.DataFrame(records)
-
-    if trio_odds_df is not None and not trio_odds_df.empty:
-        odds_clean = trio_odds_df.copy()
-        sorted_nums = np.sort(
-            odds_clean[["horse_num_1", "horse_num_2", "horse_num_3"]].to_numpy(dtype=int),
-            axis=1,
-        )
-        odds_clean["h1"] = sorted_nums[:, 0]
-        odds_clean["h2"] = sorted_nums[:, 1]
-        odds_clean["h3"] = sorted_nums[:, 2]
-        if "trio_odds" in odds_clean.columns:
-            trio_df = trio_df.merge(odds_clean[["h1", "h2", "h3", "trio_odds"]], on=["h1", "h2", "h3"], how="left")
-            trio_df["三連複オッズ"] = trio_df["trio_odds"].fillna(trio_df["三連複オッズ"])
-            trio_df.drop(columns=["trio_odds"], inplace=True)
-
-    trio_df["三連複期待値(EV)"] = (trio_df["三連複的中率(%)"] / 100.0) * trio_df["三連複オッズ"]
-    return trio_df
+    return pd.DataFrame(rows)
 
 
-def build_trio_strategies(
-    trio_df: pd.DataFrame,
+def _rank_horses_for_bets(
     horses_df: pd.DataFrame,
-    ev_threshold: float = 1.15,
-    min_prob_pct: float = 0.5,
-    max_single_tickets: int = 15,
-    max_followers: int = 7,
-    exclude_fav1: bool = False,
-) -> dict:
-    """期待値上位の組み合わせから『単品』『2頭軸流し』『フォーメーション』を自動生成する"""
-    fav1_num = int(horses_df.sort_values("win_odds", ascending=True).iloc[0]["horse_num"])
+    exclude_fav1: bool,
+    style_mode: str,
+) -> tuple[pd.DataFrame, set[int], set[int]]:
+    """
+    出走表の「印（◎○▲△☆＝AI上位5頭）」と買い目候補プールを厳密に連動させる。
+    ・堅実重視(solid): 印（◎○▲△☆＝AI上位5頭）のみを買い目対象とし、無印の超大穴を排除する。
+    ・標準バランス(balanced): 印（◎○▲△☆）を軸・相手の基本とし、相手はAI上位7頭（＋穴注目）まで。
+    ・穴狙い特化(upset): 印（◎○▲△☆）＋穴注目（単勝EV>=1.15かつAI上位9頭以内）を対象とする。
+    """
+    df = horses_df.copy()
+    df["win_odds"] = pd.to_numeric(df["win_odds"], errors="coerce").fillna(25.0)
+    df["popularity"] = df["win_odds"].rank(method="min", ascending=True).astype(int)
+    df["ai_p"] = pd.to_numeric(df["pred_win_pct"], errors="coerce").fillna(1.0) / 100.0
+    df["win_ev"] = df["ai_p"] * df["win_odds"]
+    df = df.sort_values("ai_p", ascending=False).reset_index(drop=True)
+    df["ai_rank"] = np.arange(1, len(df) + 1)
 
-    cand = trio_df[
-        (trio_df["三連複期待値(EV)"] >= ev_threshold) & (trio_df["三連複的中率(%)"] >= min_prob_pct)
-    ].sort_values("三連複期待値(EV)", ascending=False)
+    if exclude_fav1:
+        pool = df[df["popularity"] != 1].copy()
+        if len(pool) < 5:
+            pool = df.copy()
+    else:
+        pool = df.copy()
 
-    base_pool = cand if len(cand) >= 5 else trio_df[trio_df["三連複的中率(%)"] >= min_prob_pct].sort_values(
-        "三連複期待値(EV)", ascending=False
-    ).head(30)
-    if base_pool.empty:
-        base_pool = trio_df.sort_values("三連複期待値(EV)", ascending=False).head(30)
+    marked_nums = set(pool["horse_num"].astype(int).head(5).tolist())
+    top9 = pool.head(9)
+    value_nums = set(top9[top9["win_ev"] >= 1.15]["horse_num"].astype(int).tolist())
 
-    single_tickets = cand.head(max_single_tickets).copy()
+    if style_mode == "solid":
+        allowed_nums = set(marked_nums)
+        if len(allowed_nums) < 5:
+            allowed_nums |= set(pool["horse_num"].astype(int).head(5).tolist())
+    elif style_mode == "upset":
+        allowed_nums = set(marked_nums) | value_nums | set(pool["horse_num"].astype(int).head(7).tolist())
+    else:
+        top7 = pool.head(7)
+        bal_extra = set(top7[top7["win_ev"] >= 1.05]["horse_num"].astype(int).tolist())
+        allowed_nums = set(marked_nums) | bal_extra
+        if len(allowed_nums) < 6:
+            allowed_nums |= set(pool["horse_num"].astype(int).head(6).tolist())
 
-    horse_ev_score: Counter = Counter()
-    pair_ev_score: Counter = Counter()
-    for _, row in base_pool.head(40).iterrows():
-        h_tuple = (int(row["h1"]), int(row["h2"]), int(row["h3"]))
-        ev_weight = float(row["三連複期待値(EV)"]) * (float(row["三連複的中率(%)"]) ** 0.7)
-        for h in h_tuple:
-            horse_ev_score[h] += ev_weight
-        for p_pair in combinations(h_tuple, 2):
-            pair_ev_score[tuple(sorted(p_pair))] += ev_weight
+    if exclude_fav1:
+        fav1_set = set(df[df["popularity"] == 1]["horse_num"].astype(int).tolist())
+        if len(allowed_nums - fav1_set) >= 5:
+            allowed_nums -= fav1_set
+        if len(marked_nums - fav1_set) >= 3:
+            marked_nums -= fav1_set
 
-    eligible_pairs = [
-        (pair, score)
-        for pair, score in pair_ev_score.most_common()
-        if not (exclude_fav1 and fav1_num in pair)
-    ]
-    eligible_horses = [
-        (h, score)
-        for h, score in horse_ev_score.most_common()
-        if not (exclude_fav1 and h == fav1_num)
-    ]
-
-    two_axis_result = {"axis": [], "followers": [], "tickets_df": pd.DataFrame()}
-    if eligible_pairs:
-        axis1, axis2 = eligible_pairs[0][0]
-        contain_axis = trio_df[
-            trio_df.apply(lambda r: {axis1, axis2}.issubset({int(r["h1"]), int(r["h2"]), int(r["h3"])}), axis=1)
-        ].copy()
-        contain_axis["相手馬番"] = contain_axis.apply(
-            lambda r: list({int(r["h1"]), int(r["h2"]), int(r["h3"])} - {axis1, axis2})[0], axis=1
-        )
-        good_followers = contain_axis[contain_axis["三連複期待値(EV)"] >= ev_threshold].sort_values(
-            "三連複期待値(EV)", ascending=False
-        )
-        if len(good_followers) == 0:
-            good_followers = contain_axis.sort_values("三連複期待値(EV)", ascending=False).head(min(4, max_followers))
-        else:
-            good_followers = good_followers.head(max_followers)
-
-        followers_sorted = sorted(good_followers["相手馬番"].astype(int).tolist())
-        axis_tickets = contain_axis[contain_axis["相手馬番"].isin(followers_sorted)].sort_values(
-            "三連複期待値(EV)", ascending=False
-        )
-        two_axis_result = {
-            "axis": [axis1, axis2],
-            "followers": followers_sorted,
-            "tickets_df": axis_tickets.drop(columns=["相手馬番"]),
-        }
-
-    formation_result = {"col1": [], "col2": [], "col3": [], "tickets_df": pd.DataFrame()}
-    if len(eligible_horses) >= 2 and len(horse_ev_score) >= 4:
-        col1 = sorted([h for h, _ in eligible_horses[:2]])
-        col2_raw = [h for h, _ in eligible_horses[:4]]
-        col2 = sorted(list(dict.fromkeys(col1 + col2_raw)))
-        col3_limit = max(5, min(max_followers + 1, len(horses_df)))
-        col3_raw = [h for h, _ in horse_ev_score.most_common(col3_limit)]
-        col3 = sorted(list(dict.fromkeys(col2 + col3_raw)))
-
-        valid_trios = set()
-        for a, b, c in product(col1, col2, col3):
-            if len({a, b, c}) == 3:
-                valid_trios.add(tuple(sorted((a, b, c))))
-
-        if valid_trios:
-            trio_keys = set(valid_trios)
-            form_tickets = trio_df[
-                trio_df.apply(lambda r: (int(r["h1"]), int(r["h2"]), int(r["h3"])) in trio_keys, axis=1)
-            ].sort_values("三連複期待値(EV)", ascending=False)
-            formation_result = {
-                "col1": col1,
-                "col2": col2,
-                "col3": col3,
-                "tickets_df": form_tickets,
-            }
-
-    return {
-        "fav1_num": fav1_num,
-        "single_tickets": single_tickets,
-        "two_axis": two_axis_result,
-        "formation": formation_result,
-    }
-
-
-def _select_top_horses_safe(
-    ranked_horses: list[int],
-    fallback_order: list[int],
-    count: int,
-    exclude_num: int | None = None,
-) -> list[int]:
-    """指定頭数の馬番リストを安全に選出する"""
-    merged = list(dict.fromkeys(ranked_horses + fallback_order))
-    if exclude_num is not None:
-        filtered = [h for h in merged if h != exclude_num]
-        if len(filtered) >= count:
-            return sorted(filtered[:count])
-    return sorted(merged[:count])
+    return pool, marked_nums, allowed_nums
 
 
 def build_budget_mode_tickets(
@@ -381,295 +290,360 @@ def build_budget_mode_tickets(
     style_mode: str = "balanced",
 ) -> dict:
     """
-    style_mode:
-      - 'solid'    : 堅実重視（的中率の重みを強くし、上位実力馬を中心に構成）
-      - 'balanced' : 標準バランス（1頭目軸は実力上位馬、2頭目軸と相手に妙味中穴を絡める）
-      - 'upset'    : 穴狙い特化（期待値EVを最優先して高配当狙い）
+    300円 / 500円 / 2000円モードの買い目を構築する（03_app.pyで200円モードも自動派生）。
+    出走表の「印（◎○▲△☆）」と買い目が一致するよう、印馬中心で買い目を組み立てる。
     """
-    fav1_num = int(horses_df.sort_values("win_odds", ascending=True).iloc[0]["horse_num"])
-    sorted_by_prob = horses_df.sort_values("pred_win_pct", ascending=False).reset_index(drop=True)
-    fallback_horses = sorted_by_prob["horse_num"].astype(int).tolist()
-
-    # 実力圏内（AI予測勝率上位8頭、または予測勝率4%以上）を定義
-    capable_set = set(
-        sorted_by_prob[
-            (sorted_by_prob.index < 8) | (sorted_by_prob["pred_win_pct"] >= 4.0)
-        ]["horse_num"].astype(int).tolist()
+    pool, marked_nums, allowed_nums = _rank_horses_for_bets(
+        horses_df=horses_df,
+        exclude_fav1=exclude_fav1,
+        style_mode=style_mode,
     )
 
-    # スタイルに応じた確率べき乗の重み（高いほど的中率重視、低いほど高オッズEV重視）
+    pool_nums = pool["horse_num"].astype(int).tolist()
+    name_map = dict(zip(horses_df["horse_num"].astype(int), horses_df["horse_name"].astype(str)))
+    odds_map = dict(zip(horses_df["horse_num"].astype(int), horses_df["win_odds"].astype(float)))
+    prob_map = dict(zip(horses_df["horse_num"].astype(int), horses_df["pred_win_pct"].astype(float)))
+
+    axis_1 = pool_nums[0]
+
+    mark_candidates = [h for h in pool_nums[1:] if h in marked_nums]
+    if not mark_candidates:
+        mark_candidates = pool_nums[1:5]
+
     if style_mode == "solid":
-        prob_power = 1.25
-        min_trio_p = 0.60
+        axis_2 = mark_candidates[0]
     elif style_mode == "upset":
-        prob_power = 0.45
-        min_trio_p = 0.25
+        cand_ax2 = [h for h in pool_nums[1:] if h in allowed_nums] or mark_candidates
+        axis_2 = max(
+            cand_ax2[:5],
+            key=lambda h: (prob_map[h] / 100.0) * min(odds_map[h], 40.0),
+        )
     else:
-        prob_power = 0.85
-        min_trio_p = 0.40
+        top_marks = mark_candidates[:3]
+        axis_2 = max(
+            top_marks,
+            key=lambda h: ((prob_map[h] / 100.0) ** 0.7) * min(odds_map[h], 30.0),
+        )
 
-    # --- 1. 三連複 2頭軸5頭流し（500円モード ＆ 2000円モード共通） ---
-    trio_pool = trio_df[trio_df["三連複的中率(%)"] >= min_trio_p].copy()
-    if len(trio_pool) < 15:
-        trio_pool = trio_df.sort_values("三連複的中率(%)", ascending=False).head(60).copy()
+    axis_list = [axis_1, axis_2]
 
-    trio_pool["score"] = trio_pool["三連複期待値(EV)"] * (np.maximum(trio_pool["三連複的中率(%)"], 0.01) ** prob_power)
-    top_trios = trio_pool.sort_values("score", ascending=False).head(50)
+    rem_marks = [h for h in pool_nums if h in marked_nums and h not in axis_list]
+    rem_allowed = [h for h in pool_nums if h in allowed_nums and h not in axis_list and h not in rem_marks]
+    rem_others = [h for h in pool_nums if h not in axis_list and h not in rem_marks and h not in rem_allowed]
 
-    pair_score: Counter = Counter()
-    for _, r in top_trios.iterrows():
-        t_nums = (int(r["h1"]), int(r["h2"]), int(r["h3"]))
-        w = float(r["score"])
-        for p in combinations(t_nums, 2):
-            pair_score[tuple(sorted(p))] += w
+    if style_mode == "upset":
+        rem_allowed.sort(key=lambda h: (prob_map[h] / 100.0) * min(odds_map[h], 50.0), reverse=True)
 
-    # 軸ペアの選定
-    eligible_pairs = []
-    for pair, score in pair_score.most_common():
-        if exclude_fav1 and fav1_num in pair:
-            continue
-        if style_mode == "solid":
-            # 堅実モード: 軸2頭とも実力圏内
-            if pair[0] in capable_set and pair[1] in capable_set:
-                eligible_pairs.append((pair, score))
-        elif style_mode == "balanced":
-            # 標準バランス: 少なくとも1頭はAI予測上位4頭以内の本命・対抗格を含める
-            top4_set = set(fallback_horses[:4])
-            if (pair[0] in top4_set or pair[1] in top4_set) and (pair[0] in capable_set and pair[1] in capable_set):
-                eligible_pairs.append((pair, score))
+    followers_list = (rem_marks + rem_allowed + rem_others)[:5]
+
+    # 三連複 2頭軸5頭流し（5点）テーブル構築
+    trio_lookup = {}
+    if trio_df is not None and not trio_df.empty:
+        for _, r in trio_df.iterrows():
+            k = tuple(sorted([int(r["horse_num_1"]), int(r["horse_num_2"]), int(r["horse_num_3"])]))
+            trio_lookup[k] = r
+
+    trio_5_rows = []
+    for f_h in followers_list:
+        comb_t = tuple(sorted([axis_1, axis_2, f_h]))
+        if comb_t in trio_lookup:
+            tr = trio_lookup[comb_t]
+            o_t = float(tr["三連複オッズ"])
+            p_t = float(tr["三連複的中率(%)"])
+            ev_t = float(tr["三連複期待値(EV)"])
         else:
-            eligible_pairs.append((pair, score))
+            pa, pb, pc = prob_map[axis_1] / 100.0, prob_map[axis_2] / 100.0, prob_map[f_h] / 100.0
+            p_raw = 0.0
+            for x, y, z in itertools.permutations((pa, pb, pc)):
+                p_raw += x * (y / max(1e-6, 1.0 - x)) * (z / max(1e-6, 1.0 - x - y))
+            p_t = round(p_raw * 100.0, 2)
+            o_t = round(float(np.clip(0.75 / max(1e-6, p_raw), 3.0, 999.9)), 1)
+            ev_t = round((p_t / 100.0) * o_t, 2)
 
-    if not eligible_pairs:
-        eligible_pairs = [
-            (pair, score) for pair, score in pair_score.most_common()
-            if not (exclude_fav1 and fav1_num in pair)
-        ]
-
-    if eligible_pairs:
-        axis1, axis2 = eligible_pairs[0][0]
-    else:
-        safe_axes = _select_top_horses_safe([], fallback_horses, 2, fav1_num if exclude_fav1 else None)
-        axis1, axis2 = safe_axes[0], safe_axes[1]
-
-    contain_axis = trio_df[
-        trio_df.apply(lambda r: {axis1, axis2}.issubset({int(r["h1"]), int(r["h2"]), int(r["h3"])}), axis=1)
-    ].copy()
-    contain_axis["相手馬番"] = contain_axis.apply(
-        lambda r: list({int(r["h1"]), int(r["h2"]), int(r["h3"])} - {axis1, axis2})[0], axis=1
-    )
-    contain_axis["follower_score"] = contain_axis["三連複期待値(EV)"] * (
-        np.maximum(contain_axis["三連複的中率(%)"], 0.01) ** prob_power
-    )
-    top5_followers_df = contain_axis.sort_values("follower_score", ascending=False).head(5)
-    followers_5 = sorted(top5_followers_df["相手馬番"].astype(int).tolist())
-    trio_2axis_5_df = contain_axis[contain_axis["相手馬番"].isin(followers_5)].sort_values(
-        "三連複期待値(EV)", ascending=False
-    ).copy()
-    trio_2axis_5_df["券種"] = "三連複(2頭軸流し)"
-    trio_2axis_5_df["購入額(円)"] = 100
-    trio_2axis_5_df["想定払戻(円)"] = (trio_2axis_5_df["三連複オッズ"] * 100).astype(int)
-
-    # --- 2. 300円モード（極端な大穴を除外し、現実的な妙味トップ3を選出） ---
-    cross_candidates = []
-    min_win_cut = 5.0 if style_mode == "solid" else (3.5 if style_mode == "balanced" else 2.5)
-    min_wide_cut = 3.0 if style_mode == "solid" else (2.0 if style_mode == "balanced" else 1.2)
-    min_umaren_cut = 2.0 if style_mode == "solid" else (1.2 if style_mode == "balanced" else 0.8)
-    min_exacta_cut = 1.5 if style_mode == "solid" else (0.9 if style_mode == "balanced" else 0.6)
-    min_trio_cut = 0.8 if style_mode == "solid" else (0.45 if style_mode == "balanced" else 0.25)
-
-    for _, r in horses_df[horses_df["pred_win_pct"] >= min_win_cut].iterrows():
-        h_num = int(r["horse_num"])
-        if exclude_fav1 and h_num == fav1_num:
-            continue
-        ev = (float(r["pred_win_pct"]) / 100.0) * float(r["win_odds"])
-        cross_candidates.append({
-            "券種": "単勝",
-            "組み合わせ": f"{h_num:02d}",
-            "対象馬名": str(r["horse_name"]),
-            "オッズ": float(r["win_odds"]),
-            "的中率(%)": float(r["pred_win_pct"]),
-            "期待値(EV)": ev,
-            "score": ev * (float(r["pred_win_pct"]) ** (prob_power * 0.4)),
-            "購入額(円)": 100,
-            "想定払戻(円)": int(float(r["win_odds"]) * 100),
-        })
-
-    for _, r in pairs_df[pairs_df["ワイド的中率(%)"] >= min_wide_cut].iterrows():
-        if exclude_fav1 and fav1_num in (int(r["h1"]), int(r["h2"])):
-            continue
-        ev = float(r["ワイド期待値(EV)"])
-        p = float(r["ワイド的中率(%)"])
-        cross_candidates.append({
-            "券種": "ワイド",
-            "組み合わせ": r["組み合わせ"],
-            "対象馬名": r["馬名ペア"],
-            "オッズ": float(r["ワイドオッズ"]),
-            "的中率(%)": p,
-            "期待値(EV)": ev,
-            "score": ev * (p ** (prob_power * 0.4)),
-            "購入額(円)": 100,
-            "想定払戻(円)": int(float(r["ワイドオッズ"]) * 100),
-        })
-
-    for _, r in pairs_df[pairs_df["馬連的中率(%)"] >= min_umaren_cut].iterrows():
-        if exclude_fav1 and fav1_num in (int(r["h1"]), int(r["h2"])):
-            continue
-        ev = float(r["馬連期待値(EV)"])
-        p = float(r["馬連的中率(%)"])
-        cross_candidates.append({
-            "券種": "馬連",
-            "組み合わせ": r["組み合わせ"],
-            "対象馬名": r["馬名ペア"],
-            "オッズ": float(r["馬連オッズ"]),
-            "的中率(%)": p,
-            "期待値(EV)": ev,
-            "score": ev * (p ** (prob_power * 0.4)),
-            "購入額(円)": 100,
-            "想定払戻(円)": int(float(r["馬連オッズ"]) * 100),
-        })
-
-    for _, r in exacta_df[exacta_df["馬単的中率(%)"] >= min_exacta_cut].iterrows():
-        if exclude_fav1 and int(r["h1"]) == fav1_num:
-            continue
-        ev = float(r["馬単期待値(EV)"])
-        p = float(r["馬単的中率(%)"])
-        cross_candidates.append({
-            "券種": "馬単",
-            "組み合わせ": r["組み合わせ"],
-            "対象馬名": r["馬名順列"],
-            "オッズ": float(r["馬単オッズ"]),
-            "的中率(%)": p,
-            "期待値(EV)": ev,
-            "score": ev * (p ** (prob_power * 0.4)),
-            "購入額(円)": 100,
-            "想定払戻(円)": int(float(r["馬単オッズ"]) * 100),
-        })
-
-    for _, r in trio_df[trio_df["三連複的中率(%)"] >= min_trio_cut].iterrows():
-        if exclude_fav1 and fav1_num in (int(r["h1"]), int(r["h2"]), int(r["h3"])):
-            continue
-        ev = float(r["三連複期待値(EV)"])
-        p = float(r["三連複的中率(%)"])
-        cross_candidates.append({
+        trio_5_rows.append({
             "券種": "三連複",
-            "組み合わせ": r["組み合わせ"],
-            "対象馬名": r["馬名トリオ"],
-            "オッズ": float(r["三連複オッズ"]),
-            "的中率(%)": p,
-            "期待値(EV)": ev,
-            "score": ev * (p ** (prob_power * 0.4)),
+            "組み合わせ": f"{comb_t[0]:02d} - {comb_t[1]:02d} - {comb_t[2]:02d}",
+            "馬名トリオ": f"{name_map[comb_t[0]]} × {name_map[comb_t[1]]} × {name_map[comb_t[2]]}",
+            "三連複オッズ": o_t,
+            "三連複的中率(%)": p_t,
+            "三連複期待値(EV)": ev_t,
             "購入額(円)": 100,
-            "想定払戻(円)": int(float(r["三連複オッズ"]) * 100),
+            "想定払戻(円)": int(round(o_t * 100)),
         })
 
-    if len(cross_candidates) < 3:
-        for _, r in sorted_by_prob.head(5).iterrows():
-            h_num = int(r["horse_num"])
-            ev = (float(r["pred_win_pct"]) / 100.0) * float(r["win_odds"])
-            cross_candidates.append({
-                "券種": "単勝",
-                "組み合わせ": f"{h_num:02d}",
-                "対象馬名": str(r["horse_name"]),
-                "オッズ": float(r["win_odds"]),
-                "的中率(%)": float(r["pred_win_pct"]),
-                "期待値(EV)": ev,
-                "score": ev,
-                "購入額(円)": 100,
-                "想定払戻(円)": int(float(r["win_odds"]) * 100),
-            })
+    df_500_tickets = pd.DataFrame(trio_5_rows)
 
-    mode_300_df = (
-        pd.DataFrame(cross_candidates)
-        .drop_duplicates(subset=["券種", "組み合わせ"])
-        .sort_values("score", ascending=False)
-        .head(3)
-        .drop(columns=["score"])
-        .reset_index(drop=True)
-    )
+    # 300円モード（および200円モード元データ）：印馬中心の全券種バランス厳選3点
+    if style_mode == "solid":
+        p_exp, ev_cap = 1.15, 2.5
+    elif style_mode == "upset":
+        p_exp, ev_cap = 0.55, 5.0
+    else:
+        p_exp, ev_cap = 0.85, 3.5
 
-    # --- 3. 2000円モード用：馬単 4頭ボックス（12点 × 100円 = 1200円） ---
-    top_exacta = exacta_df[exacta_df["馬単的中率(%)"] >= min_exacta_cut].copy()
-    if top_exacta.empty:
-        top_exacta = exacta_df.sort_values("馬単的中率(%)", ascending=False).head(30).copy()
-    top_exacta["score"] = top_exacta["馬単期待値(EV)"] * (np.maximum(top_exacta["馬単的中率(%)"], 0.01) ** prob_power)
+    cand_300 = []
 
-    exacta_horse_score: Counter = Counter()
-    for _, r in top_exacta.sort_values("score", ascending=False).head(30).iterrows():
-        w_e = float(r["score"])
-        exacta_horse_score[int(r["h1"])] += w_e * 1.2
-        exacta_horse_score[int(r["h2"])] += w_e
+    for h in pool_nums:
+        if h not in allowed_nums:
+            continue
+        p_w = prob_map[h] / 100.0
+        o_w = odds_map[h]
+        ev_w = p_w * o_w
+        if ev_w < 0.75:
+            continue
+        score = (p_w ** p_exp) * min(ev_w, ev_cap)
+        if h == axis_1:
+            score *= 1.15
+        cand_300.append({
+            "券種": "単勝",
+            "組み合わせ": f"{h:02d}",
+            "対象馬名": name_map[h],
+            "オッズ": round(o_w, 1),
+            "的中率(%)": round(p_w * 100.0, 2),
+            "期待値(EV)": round(ev_w, 2),
+            "購入額(円)": 100,
+            "想定払戻(円)": int(round(o_w * 100)),
+            "_score": score,
+        })
 
-    box4_pool = [
-        h for h, _ in exacta_horse_score.most_common()
-        if (style_mode == "upset" or h in capable_set)
-    ]
-    box4_nums = _select_top_horses_safe(
-        box4_pool,
-        fallback_horses,
-        min(4, len(fallback_horses)),
-        fav1_num if exclude_fav1 else None,
-    )
+    if pairs_df is not None and not pairs_df.empty:
+        for _, r in pairs_df.iterrows():
+            h1, h2 = int(r["horse_num_1"]), int(r["horse_num_2"])
+            if h1 not in allowed_nums or h2 not in allowed_nums:
+                continue
+            if style_mode != "upset" and (h1 not in marked_nums and h2 not in marked_nums):
+                continue
 
-    exacta_box_perms = set(permutations(box4_nums, 2))
-    exacta_box4_df = exacta_df[
-        exacta_df.apply(lambda r: (int(r["h1"]), int(r["h2"])) in exacta_box_perms, axis=1)
-    ].sort_values("馬単期待値(EV)", ascending=False).copy()
-    exacta_box4_df["券種"] = "馬単(4頭BOX)"
-    exacta_box4_df["購入額(円)"] = 100
-    exacta_box4_df["想定払戻(円)"] = (exacta_box4_df["馬単オッズ"] * 100).astype(int)
+            p_u = float(r["馬連的中率(%)"]) / 100.0
+            o_u = float(r["馬連オッズ"])
+            ev_u = float(r["馬連期待値(EV)"])
+            if p_u >= 0.015 and ev_u >= 0.85:
+                sc_u = (p_u ** p_exp) * min(ev_u, ev_cap)
+                if axis_1 in (h1, h2):
+                    sc_u *= 1.20
+                cand_300.append({
+                    "券種": "馬連",
+                    "組み合わせ": str(r["組み合わせ"]),
+                    "対象馬名": str(r["馬名ペア"]),
+                    "オッズ": o_u,
+                    "的中率(%)": float(r["馬連的中率(%)"]),
+                    "期待値(EV)": ev_u,
+                    "購入額(円)": 100,
+                    "想定払戻(円)": int(round(o_u * 100)),
+                    "_score": sc_u,
+                })
 
-    # --- 4. 2000円モード用：ワイド 3頭ボックス（3点 × 100円 = 300円） ---
-    top_wide = pairs_df[pairs_df["ワイド的中率(%)"] >= min_wide_cut].copy()
-    if top_wide.empty:
-        top_wide = pairs_df.sort_values("ワイド的中率(%)", ascending=False).head(25).copy()
-    top_wide["score"] = top_wide["ワイド期待値(EV)"] * (np.maximum(top_wide["ワイド的中率(%)"], 0.01) ** prob_power)
+            p_wd = float(r["ワイド的中率(%)"]) / 100.0
+            o_wd = float(r["ワイドオッズ"])
+            ev_wd = float(r["ワイド期待値(EV)"])
+            if p_wd >= 0.04 and ev_wd >= 0.85:
+                sc_wd = (p_wd ** p_exp) * min(ev_wd, ev_cap)
+                if axis_1 in (h1, h2):
+                    sc_wd *= 1.20
+                cand_300.append({
+                    "券種": "ワイド",
+                    "組み合わせ": str(r["組み合わせ"]),
+                    "対象馬名": str(r["馬名ペア"]),
+                    "オッズ": o_wd,
+                    "的中率(%)": float(r["ワイド的中率(%)"]),
+                    "期待値(EV)": ev_wd,
+                    "購入額(円)": 100,
+                    "想定払戻(円)": int(round(o_wd * 100)),
+                    "_score": sc_wd,
+                })
 
-    wide_horse_score: Counter = Counter()
-    for _, r in top_wide.sort_values("score", ascending=False).head(25).iterrows():
-        w_w = float(r["score"])
-        wide_horse_score[int(r["h1"])] += w_w
-        wide_horse_score[int(r["h2"])] += w_w
+    if trio_df is not None and not trio_df.empty:
+        for _, r in trio_df.iterrows():
+            h1, h2, h3 = int(r["horse_num_1"]), int(r["horse_num_2"]), int(r["horse_num_3"])
+            if h1 not in allowed_nums or h2 not in allowed_nums or h3 not in allowed_nums:
+                continue
+            mark_cnt = sum(1 for x in (h1, h2, h3) if x in marked_nums)
+            if mark_cnt < 2:
+                continue
+            p_tr = float(r["三連複的中率(%)"]) / 100.0
+            o_tr = float(r["三連複オッズ"])
+            ev_tr = float(r["三連複期待値(EV)"])
+            if p_tr >= 0.008 and ev_tr >= 0.90:
+                sc_tr = (p_tr ** p_exp) * min(ev_tr, ev_cap)
+                if axis_1 in (h1, h2, h3):
+                    sc_tr *= 1.15
+                cand_300.append({
+                    "券種": "三連複",
+                    "組み合わせ": str(r["組み合わせ"]),
+                    "対象馬名": str(r["馬名トリオ"]),
+                    "オッズ": o_tr,
+                    "的中率(%)": float(r["三連複的中率(%)"]),
+                    "期待値(EV)": ev_tr,
+                    "購入額(円)": 100,
+                    "想定払戻(円)": int(round(o_tr * 100)),
+                    "_score": sc_tr,
+                })
 
-    box3_pool = [
-        h for h, _ in wide_horse_score.most_common()
-        if (style_mode == "upset" or h in capable_set)
-    ]
-    box3_nums = _select_top_horses_safe(
-        box3_pool,
-        fallback_horses,
-        min(3, len(fallback_horses)),
-        fav1_num if exclude_fav1 else None,
-    )
+    if cand_300:
+        c300_df = pd.DataFrame(cand_300).sort_values("_score", ascending=False)
+        picked_300 = c300_df.head(3).drop(columns=["_score"]).reset_index(drop=True)
+    else:
+        fb_rows = []
+        top_m = pool_nums[:4]
+        for h1, h2 in itertools.combinations(top_m, 2):
+            sub = pairs_df[(pairs_df["horse_num_1"] == min(h1, h2)) & (pairs_df["horse_num_2"] == max(h1, h2))]
+            if not sub.empty:
+                r = sub.iloc[0]
+                fb_rows.append({
+                    "券種": "ワイド",
+                    "組み合わせ": str(r["組み合わせ"]),
+                    "対象馬名": str(r["馬名ペア"]),
+                    "オッズ": float(r["ワイドオッズ"]),
+                    "的中率(%)": float(r["ワイド的中率(%)"]),
+                    "期待値(EV)": float(r["ワイド期待値(EV)"]),
+                    "購入額(円)": 100,
+                    "想定払戻(円)": int(round(float(r["ワイドオッズ"]) * 100)),
+                })
+            if len(fb_rows) >= 3:
+                break
+        picked_300 = pd.DataFrame(fb_rows)
 
-    wide_box_pairs = {tuple(sorted(p)) for p in combinations(box3_nums, 2)}
-    wide_box3_df = pairs_df[
-        pairs_df.apply(lambda r: (int(r["h1"]), int(r["h2"])) in wide_box_pairs, axis=1)
-    ].sort_values("ワイド期待値(EV)", ascending=False).copy()
-    wide_box3_df["券種"] = "ワイド(3頭BOX)"
-    wide_box3_df["購入額(円)"] = 100
-    wide_box3_df["想定払戻(円)"] = (wide_box3_df["ワイドオッズ"] * 100).astype(int)
+    # 2000円モード（三連複5点 + 馬単4頭BOX12点 + ワイド3頭BOX3点 = 20点・2000円）
+    box4_pool = [h for h in pool_nums if h in allowed_nums][:4]
+    if len(box4_pool) < 4:
+        box4_pool = pool_nums[:4]
+    exacta_box_nums = sorted(box4_pool)
+    wide_box_nums = sorted(box4_pool[:3])
+
+    ex_lookup = {}
+    if exacta_df is not None and not exacta_df.empty:
+        for _, r in exacta_df.iterrows():
+            ex_lookup[(int(r["horse_num_1"]), int(r["horse_num_2"]))] = r
+
+    exacta_12_rows = []
+    for h1, h2 in itertools.permutations(exacta_box_nums, 2):
+        if (h1, h2) in ex_lookup:
+            er = ex_lookup[(h1, h2)]
+            o_e = float(er["馬単オッズ"])
+            p_e = float(er["馬単的中率(%)"])
+            ev_e = float(er["馬単期待値(EV)"])
+        else:
+            p1, p2 = prob_map[h1] / 100.0, prob_map[h2] / 100.0
+            pe_raw = p1 * (p2 / max(1e-6, 1.0 - p1))
+            p_e = round(pe_raw * 100.0, 2)
+            o_e = round(float(np.clip(0.75 / max(1e-6, pe_raw), 2.0, 1999.9)), 1)
+            ev_e = round((p_e / 100.0) * o_e, 2)
+        exacta_12_rows.append({
+            "券種": "馬単",
+            "組み合わせ": f"{h1:02d} → {h2:02d}",
+            "馬名順列": f"{name_map[h1]} → {name_map[h2]}",
+            "馬単オッズ": o_e,
+            "馬単的中率(%)": p_e,
+            "馬単期待値(EV)": ev_e,
+            "購入額(円)": 100,
+            "想定払戻(円)": int(round(o_e * 100)),
+        })
+    df_exacta_2000 = pd.DataFrame(exacta_12_rows).sort_values("馬単的中率(%)", ascending=False).reset_index(drop=True)
+
+    pair_lookup = {}
+    if pairs_df is not None and not pairs_df.empty:
+        for _, r in pairs_df.iterrows():
+            pair_lookup[(int(r["horse_num_1"]), int(r["horse_num_2"]))] = r
+
+    wide_3_rows = []
+    for h1, h2 in itertools.combinations(wide_box_nums, 2):
+        k = (min(h1, h2), max(h1, h2))
+        if k in pair_lookup:
+            pr = pair_lookup[k]
+            o_w = float(pr["ワイドオッズ"])
+            p_w = float(pr["ワイド的中率(%)"])
+            ev_w = float(pr["ワイド期待値(EV)"])
+        else:
+            o_w, p_w, ev_w = 3.5, 25.0, 0.88
+        wide_3_rows.append({
+            "券種": "ワイド",
+            "組み合わせ": f"{k[0]:02d} - {k[1]:02d}",
+            "馬名ペア": f"{name_map[k[0]]} × {name_map[k[1]]}",
+            "ワイドオッズ": o_w,
+            "ワイド的中率(%)": p_w,
+            "ワイド期待値(EV)": ev_w,
+            "購入額(円)": 100,
+            "想定払戻(円)": int(round(o_w * 100)),
+        })
+    df_wide_2000 = pd.DataFrame(wide_3_rows)
 
     return {
-        "fav1_num": fav1_num,
-        "mode_500": {
-            "axis": [axis1, axis2],
-            "followers": followers_5,
-            "tickets_df": trio_2axis_5_df,
-            "total_cost": len(trio_2axis_5_df) * 100,
-        },
         "mode_300": {
-            "tickets_df": mode_300_df,
-            "total_cost": len(mode_300_df) * 100,
+            "tickets_df": picked_300,
+            "total_cost": int(picked_300["購入額(円)"].sum()) if not picked_300.empty else 300,
+        },
+        "mode_500": {
+            "axis": axis_list,
+            "followers": followers_list,
+            "tickets_df": df_500_tickets,
+            "total_cost": int(df_500_tickets["購入額(円)"].sum()) if not df_500_tickets.empty else 500,
         },
         "mode_2000": {
-            "trio_axis": [axis1, axis2],
-            "trio_followers": followers_5,
-            "trio_df": trio_2axis_5_df,
-            "exacta_box": box4_nums,
-            "exacta_df": exacta_box4_df,
-            "wide_box": box3_nums,
-            "wide_df": wide_box3_df,
-            "total_cost": (len(trio_2axis_5_df) + len(exacta_box4_df) + len(wide_box3_df)) * 100,
+            "trio_axis": axis_list,
+            "trio_followers": followers_list,
+            "exacta_box": exacta_box_nums,
+            "wide_box": wide_box_nums,
+            "trio_df": df_500_tickets.copy(),
+            "exacta_df": df_exacta_2000,
+            "wide_df": df_wide_2000,
+            "total_cost": 2000,
         },
+    }
+
+
+def build_trio_strategies(
+    trio_df: pd.DataFrame,
+    horses_df: pd.DataFrame,
+    ev_threshold: float = 1.15,
+    min_prob_pct: float = 0.4,
+    max_single_tickets: int = 10,
+    max_followers: int = 8,
+    exclude_fav1: bool = False,
+) -> dict:
+    """詳細タブの三連複フォーメーションを構築する"""
+    df = horses_df.copy()
+    df["win_odds"] = pd.to_numeric(df["win_odds"], errors="coerce").fillna(25.0)
+    df["popularity"] = df["win_odds"].rank(method="min", ascending=True).astype(int)
+    df = df.sort_values("pred_win_pct", ascending=False).reset_index(drop=True)
+    if exclude_fav1:
+        sub = df[df["popularity"] != 1]
+        if len(sub) >= 6:
+            df = sub.reset_index(drop=True)
+
+    nums = df["horse_num"].astype(int).tolist()
+    col1 = nums[:2]
+    col2 = nums[:4]
+    col3 = nums[:min(len(nums), max(5, max_followers))]
+
+    valid_combos = set()
+    for a in col1:
+        for b in col2:
+            for c in col3:
+                if len({a, b, c}) == 3:
+                    valid_combos.add(tuple(sorted([a, b, c])))
+
+    if trio_df is not None and not trio_df.empty and valid_combos:
+        mask = [
+            tuple(sorted([int(r["horse_num_1"]), int(r["horse_num_2"]), int(r["horse_num_3"])])) in valid_combos
+            for _, r in trio_df.iterrows()
+        ]
+        form_df = trio_df[mask].sort_values("三連複期待値(EV)", ascending=False).reset_index(drop=True)
+        single_df = (
+            trio_df[(trio_df["三連複期待値(EV)"] >= ev_threshold) & (trio_df["三連複的中率(%)"] >= min_prob_pct)]
+            .sort_values("三連複期待値(EV)", ascending=False)
+            .head(max_single_tickets)
+            .reset_index(drop=True)
+        )
+    else:
+        form_df = pd.DataFrame()
+        single_df = pd.DataFrame()
+
+    return {
+        "formation": {
+            "col1": col1,
+            "col2": col2,
+            "col3": col3,
+            "tickets_df": form_df,
+        },
+        "single": single_df,
     }
