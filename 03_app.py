@@ -45,279 +45,110 @@ st.set_page_config(page_title="KAZUYAN AI | 期待値＆買い目シミュレー
 st.markdown(
     """
 <style>
-.stApp {
-    background-color: #f4f6f9;
-}
-.block-container {
-    padding-top: 3.8rem !important;
-    padding-bottom: 2.5rem;
-    max-width: 1420px;
-}
-div[data-testid="stDeployButton"] {
-    display: none;
-}
+.stApp { background-color: #f4f6f9; }
+.block-container { padding-top: 3.8rem !important; padding-bottom: 2.5rem; max-width: 1420px; }
+div[data-testid="stDeployButton"] { display: none; }
 
-/* トップナビゲーションバー */
 .top-navbar {
-    background-color: #16213e;
-    color: #ffffff;
-    padding: 12px 22px;
-    border-radius: 8px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 12px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.12);
-    flex-wrap: wrap;
-    gap: 8px;
+    background-color: #16213e; color: #ffffff; padding: 12px 22px; border-radius: 8px;
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.12); flex-wrap: wrap; gap: 8px;
 }
-.top-navbar .brand {
-    font-size: 1.25rem;
-    font-weight: 800;
-    letter-spacing: 0.06em;
-    color: #ffffff;
-}
-.top-navbar .nav-badges {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    font-size: 0.8rem;
-    flex-wrap: wrap;
-}
-.nav-pill {
-    background-color: rgba(255,255,255,0.14);
-    padding: 4px 11px;
-    border-radius: 6px;
-    color: #e2e8f0;
-    font-weight: 600;
-}
-.nav-pill-warn {
-    background-color: #b45309;
-    padding: 4px 11px;
-    border-radius: 6px;
-    color: #ffffff;
-    font-weight: 700;
-}
-.nav-pill-real {
-    background-color: #047857;
-    padding: 4px 11px;
-    border-radius: 6px;
-    color: #ffffff;
-    font-weight: 700;
-}
+.top-navbar .brand { font-size: 1.25rem; font-weight: 800; letter-spacing: 0.06em; color: #ffffff; }
+.top-navbar .nav-badges { display: flex; gap: 8px; align-items: center; font-size: 0.8rem; flex-wrap: wrap; }
+.nav-pill { background-color: rgba(255,255,255,0.14); padding: 4px 11px; border-radius: 6px; color: #e2e8f0; font-weight: 600; }
+.nav-pill-warn { background-color: #b45309; padding: 4px 11px; border-radius: 6px; color: #ffffff; font-weight: 700; }
+.nav-pill-real { background-color: #047857; padding: 4px 11px; border-radius: 6px; color: #ffffff; font-weight: 700; }
 
-/* 開催馬場＆レース移動ピルボタン */
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button,
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
-    min-height: 40px !important;
-    height: 40px !important;
-    border-radius: 8px !important;
-    padding: 4px 10px !important;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important;
+    min-height: 40px !important; height: 40px !important; border-radius: 8px !important;
+    padding: 4px 10px !important; box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important;
     transition: all 0.12s ease-in-out !important;
 }
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"],
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"] {
-    background-color: #ffffff !important;
-    border: 1.5px solid #cbd5e1 !important;
-    color: #1e293b !important;
+    background-color: #ffffff !important; border: 1.5px solid #cbd5e1 !important; color: #1e293b !important;
 }
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover,
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover {
-    border-color: #192442 !important;
-    background-color: #f1f5f9 !important;
+    border-color: #192442 !important; background-color: #f1f5f9 !important;
 }
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"],
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"] {
-    background-color: #192442 !important;
-    border: 1.5px solid #192442 !important;
-    color: #ffffff !important;
+    background-color: #192442 !important; border: 1.5px solid #192442 !important; color: #ffffff !important;
 }
 .venue-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p,
 .race-nav-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p {
-    font-size: 0.92rem !important;
-    font-weight: 700 !important;
-    white-space: nowrap !important;
+    font-size: 0.92rem !important; font-weight: 700 !important; white-space: nowrap !important;
 }
 
-/* レースヘッダーバナー */
 .race-banner {
     background: linear-gradient(135deg, #4a154b 0%, #611f54 60%, #3b123c 100%);
-    color: #ffffff;
-    border-radius: 12px;
-    padding: 18px 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-top: 6px;
-    margin-bottom: 18px;
-    box-shadow: 0 4px 12px rgba(74, 21, 75, 0.25);
+    color: #ffffff; border-radius: 12px; padding: 18px 24px;
+    display: flex; justify-content: space-between; align-items: center;
+    margin-top: 6px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(74, 21, 75, 0.25);
 }
-.race-title-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 4px;
-    flex-wrap: wrap;
-}
-.race-venue-r {
-    font-size: 1.25rem;
-    font-weight: 800;
-}
-.race-time {
-    font-size: 0.88rem;
-    color: #e9d5ff;
-}
-.race-name-main {
-    font-size: 1.45rem;
-    font-weight: 800;
-    margin: 2px 0 8px 0;
-    letter-spacing: 0.02em;
-}
-.race-meta-row {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    flex-wrap: wrap;
-    font-size: 0.85rem;
-}
-.cond-badge {
-    background-color: #fde68a;
-    color: #78350f;
-    font-weight: 700;
-    padding: 2px 8px;
-    border-radius: 4px;
-}
-.status-badge {
-    background-color: #ecfdf5;
-    color: #047857;
-    border: 1px solid #10b981;
-    font-weight: 700;
-    padding: 2px 10px;
-    border-radius: 5px;
-    font-size: 0.78rem;
-}
+.race-title-row { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+.race-venue-r { font-size: 1.25rem; font-weight: 800; }
+.race-time { font-size: 0.88rem; color: #e9d5ff; }
+.race-name-main { font-size: 1.45rem; font-weight: 800; margin: 2px 0 8px 0; letter-spacing: 0.02em; }
+.race-meta-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }
+.cond-badge { background-color: #fde68a; color: #78350f; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
+.status-badge { background-color: #ecfdf5; color: #047857; border: 1px solid #10b981; font-weight: 700; padding: 2px 10px; border-radius: 5px; font-size: 0.78rem; }
 
-/* 右側リングスコア */
-.ring-group {
-    display: flex;
-    gap: 14px;
-}
+.ring-group { display: flex; gap: 14px; }
 .ring-circle {
-    width: 68px;
-    height: 68px;
-    border-radius: 50%;
-    background: rgba(20, 12, 28, 0.55);
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    align-items: center;
+    width: 68px; height: 68px; border-radius: 50%; background: rgba(20, 12, 28, 0.55);
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
     box-shadow: inset 0 0 8px rgba(0,0,0,0.4);
 }
 .ring-orange { border: 3.5px solid #f59e0b; }
 .ring-green { border: 3.5px solid #10b981; }
-.ring-num-orange {
-    font-size: 1.2rem;
-    font-weight: 800;
-    color: #fbbf24;
-    line-height: 1.1;
-}
-.ring-num-green {
-    font-size: 1.2rem;
-    font-weight: 800;
-    color: #34d399;
-    line-height: 1.1;
-}
-.ring-label {
-    font-size: 0.68rem;
-    color: #f3e8ff;
-    margin-top: 2px;
-}
+.ring-num-orange { font-size: 1.2rem; font-weight: 800; color: #fbbf24; line-height: 1.1; }
+.ring-num-green { font-size: 1.2rem; font-weight: 800; color: #34d399; line-height: 1.1; }
+.ring-label { font-size: 0.68rem; color: #f3e8ff; margin-top: 2px; }
 
-/* モード選択タイルボタン専用ラッパー */
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
-    min-height: 84px !important;
-    border-radius: 12px !important;
-    padding: 12px 16px !important;
-    transition: all 0.15s ease-in-out !important;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.08) !important;
+    min-height: 84px !important; border-radius: 12px !important; padding: 12px 16px !important;
+    transition: all 0.15s ease-in-out !important; box-shadow: 0 2px 6px rgba(0,0,0,0.08) !important;
 }
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"] {
-    background-color: #ffffff !important;
-    border: 2px solid #cbd5e1 !important;
-    color: #1e293b !important;
+    background-color: #ffffff !important; border: 2px solid #cbd5e1 !important; color: #1e293b !important;
 }
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="secondary"]:hover {
-    border-color: #4a154b !important;
-    background-color: #fdf4ff !important;
-    transform: translateY(-2px);
+    border-color: #4a154b !important; background-color: #fdf4ff !important; transform: translateY(-2px);
 }
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button[kind="primary"] {
     background: linear-gradient(135deg, #192442 0%, #4a154b 100%) !important;
-    border: 2.5px solid #4a154b !important;
-    color: #ffffff !important;
+    border: 2.5px solid #4a154b !important; color: #ffffff !important;
     box-shadow: 0 4px 12px rgba(74, 21, 75, 0.3) !important;
 }
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button p {
-    font-size: 1.45rem !important;
-    font-weight: 800 !important;
-    letter-spacing: 0.04em !important;
+    font-size: 1.45rem !important; font-weight: 800 !important; letter-spacing: 0.04em !important;
 }
 
-/* 出走表カスタムテーブル */
 .shutuba-wrapper {
-    background: #ffffff;
-    border-radius: 10px;
-    overflow-x: auto;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-    border: 1px solid #e2e8f0;
-    margin-bottom: 20px;
+    background: #ffffff; border-radius: 10px; overflow-x: auto;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; margin-bottom: 20px;
 }
-.shutuba-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.88rem;
-    text-align: center;
-}
+.shutuba-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; text-align: center; }
 .shutuba-table thead th {
-    background-color: #192442;
-    color: #ffffff;
-    font-weight: 600;
-    padding: 9px 6px;
-    font-size: 0.78rem;
-    white-space: nowrap;
-    border-bottom: 2px solid #0f172a;
+    background-color: #192442; color: #ffffff; font-weight: 600;
+    padding: 9px 6px; font-size: 0.78rem; white-space: nowrap; border-bottom: 2px solid #0f172a;
 }
-.shutuba-table tbody tr {
-    border-bottom: 1px solid #e2e8f0;
-    transition: background-color 0.15s;
-}
-.shutuba-table tbody tr:hover {
-    filter: brightness(0.97);
-}
+.shutuba-table tbody tr { border-bottom: 1px solid #e2e8f0; transition: background-color 0.15s; }
+.shutuba-table tbody tr:hover { filter: brightness(0.97); }
 .row-rank-1 { background-color: #fdf2f2; }
 .row-rank-2 { background-color: #fff8eb; }
 .row-rank-3 { background-color: #f8fafc; }
-.row-selected {
-    background-color: #eff6ff !important;
-    box-shadow: inset 4px 0 0 #2563eb;
-}
-.shutuba-table td {
-    padding: 8px 6px;
-    vertical-align: middle;
-}
+.row-selected { background-color: #eff6ff !important; box-shadow: inset 4px 0 0 #2563eb; }
+.shutuba-table td { padding: 8px 6px; vertical-align: middle; }
 
-/* JRA 8色枠番丸バッジ */
 .waku-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 50%;
-    font-weight: 800;
-    font-size: 0.82rem;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.18);
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 50%; font-weight: 800;
+    font-size: 0.82rem; box-shadow: 0 1px 2px rgba(0,0,0,0.18);
 }
 .waku-1 { background: #ffffff; color: #111827; border: 1.5px solid #9ca3af; }
 .waku-2 { background: #1f2937; color: #ffffff; }
@@ -328,171 +159,59 @@ div[data-testid="stDeployButton"] {
 .waku-7 { background: #f97316; color: #ffffff; }
 .waku-8 { background: #ec4899; color: #ffffff; }
 
-/* 馬番＆印 */
 .umaban-txt { font-weight: 800; font-size: 1.0rem; }
 .umaban-top { color: #dc2626; }
 .mark-badge { font-weight: 900; font-size: 1.02rem; color: #dc2626; }
-
-/* オッズ＆人気2段 */
 .pop-tag { font-size: 0.70rem; color: #2563eb; font-weight: 600; line-height: 1.1; }
 .odds-val { font-size: 0.98rem; font-weight: 800; color: #111827; line-height: 1.2; }
 
-/* 馬名＆騎手2段（インライン選択リンク） */
 .horse-cell { text-align: left !important; padding-left: 10px !important; white-space: nowrap; }
 .horse-title { font-weight: 800; font-size: 0.93rem; color: #1d4ed8; line-height: 1.25; }
-.horse-link {
-    color: #1d4ed8 !important;
-    text-decoration: none !important;
-    cursor: pointer;
-}
-.horse-link:hover {
-    text-decoration: underline !important;
-    color: #1e40af !important;
-}
+.horse-link { color: #1d4ed8 !important; text-decoration: none !important; cursor: pointer; }
+.horse-link:hover { text-decoration: underline !important; color: #1e40af !important; }
 .jockey-sub { font-size: 0.74rem; color: #64748b; margin-top: 2px; }
 
-/* シグナルバッジ */
-.sig-axis {
-    background-color: #dc2626;
-    color: #ffffff;
-    font-weight: 800;
-    font-size: 0.74rem;
-    padding: 3px 10px;
-    border-radius: 5px;
-    display: inline-block;
-    white-space: nowrap;
-}
-.sig-value {
-    background-color: #fff7ed;
-    color: #c2410c;
-    border: 1px solid #f97316;
-    font-weight: 800;
-    font-size: 0.74rem;
-    padding: 2px 8px;
-    border-radius: 5px;
-    display: inline-block;
-    white-space: nowrap;
-}
-.sig-himo {
-    background-color: #ffffff;
-    color: #2563eb;
-    border: 1px solid #93c5fd;
-    font-weight: 700;
-    font-size: 0.74rem;
-    padding: 2px 8px;
-    border-radius: 5px;
-    display: inline-block;
-    white-space: nowrap;
-}
-.sig-wait {
-    background-color: #f8fafc;
-    color: #64748b;
-    border: 1px solid #cbd5e1;
-    font-weight: 600;
-    font-size: 0.74rem;
-    padding: 2px 8px;
-    border-radius: 5px;
-    display: inline-block;
-    white-space: nowrap;
-}
+.sig-axis { background-color: #dc2626; color: #ffffff; font-weight: 800; font-size: 0.74rem; padding: 3px 10px; border-radius: 5px; display: inline-block; white-space: nowrap; }
+.sig-value { background-color: #fff7ed; color: #c2410c; border: 1px solid #f97316; font-weight: 800; font-size: 0.74rem; padding: 2px 8px; border-radius: 5px; display: inline-block; white-space: nowrap; }
+.sig-himo { background-color: #ffffff; color: #2563eb; border: 1px solid #93c5fd; font-weight: 700; font-size: 0.74rem; padding: 2px 8px; border-radius: 5px; display: inline-block; white-space: nowrap; }
+.sig-wait { background-color: #f8fafc; color: #64748b; border: 1px solid #cbd5e1; font-weight: 600; font-size: 0.74rem; padding: 2px 8px; border-radius: 5px; display: inline-block; white-space: nowrap; }
 
-/* 信頼度ランク */
 .conf-s { color: #dc2626; font-weight: 900; font-size: 1.02rem; }
 .conf-a { color: #dc2626; font-weight: 800; font-size: 0.98rem; }
 .conf-b { color: #d97706; font-weight: 800; font-size: 0.92rem; }
 .conf-none { color: #94a3b8; font-weight: 600; }
 
-/* 能力値＆プログレスバー */
 .ability-wrap { display: inline-flex; align-items: center; gap: 6px; justify-content: center; }
 .ability-num { font-weight: 800; font-size: 0.88rem; min-width: 34px; text-align: right; }
 .bar-bg { width: 48px; height: 7px; background-color: #e2e8f0; border-radius: 4px; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 4px; }
 
-/* 確率カラム */
 .prob-hot { color: #dc2626; font-weight: 800; }
 .prob-warm { color: #ea580c; font-weight: 700; }
 .prob-norm { color: #1e293b; font-weight: 600; }
 
-/* 買い目モードカード */
 .bet-card {
-    background: #ffffff;
-    border-left: 5px solid #4a154b;
-    border-radius: 8px;
-    padding: 14px 18px;
-    margin-top: 10px;
-    margin-bottom: 12px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+    background: #ffffff; border-left: 5px solid #4a154b; border-radius: 8px;
+    padding: 14px 18px; margin-top: 10px; margin-bottom: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.06);
 }
-.bet-card-title {
-    font-size: 1.04rem;
-    font-weight: 800;
-    color: #192442;
-    margin-bottom: 8px;
-}
+.bet-card-title { font-size: 1.04rem; font-weight: 800; color: #192442; margin-bottom: 8px; }
 .horse-chip {
-    display: inline-block;
-    background: #f1f5f9;
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    padding: 3px 10px;
-    margin: 2px 5px 2px 0;
-    font-weight: 700;
-    font-size: 0.86rem;
-    color: #0f172a;
+    display: inline-block; background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px;
+    padding: 3px 10px; margin: 2px 5px 2px 0; font-weight: 700; font-size: 0.86rem; color: #0f172a;
 }
-.horse-chip-axis {
-    background: #fef2f2;
-    border-color: #fca5a5;
-    color: #b91c1c;
-}
+.horse-chip-axis { background: #fef2f2; border-color: #fca5a5; color: #b91c1c; }
 
-/* ヘルプ画面カード */
 .help-card {
-    background: #ffffff;
-    border: 1px solid #e2e8f0;
-    border-radius: 10px;
-    padding: 18px 22px;
-    margin-bottom: 16px;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.05);
+    background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
+    padding: 18px 22px; margin-bottom: 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.05);
 }
-.help-card h4 {
-    color: #192442;
-    margin-top: 0;
-    margin-bottom: 10px;
-    padding-bottom: 6px;
-    border-bottom: 2px solid #4a154b;
-    font-weight: 800;
-}
-.help-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.88rem;
-    margin-top: 8px;
-}
-.help-table th {
-    background-color: #f1f5f9;
-    color: #192442;
-    text-align: left;
-    padding: 8px 12px;
-    border: 1px solid #cbd5e1;
-    width: 24%;
-}
-.help-table td {
-    padding: 8px 12px;
-    border: 1px solid #e2e8f0;
-    color: #334155;
-    line-height: 1.5;
-}
+.help-card h4 { color: #192442; margin-top: 0; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 2px solid #4a154b; font-weight: 800; }
+.help-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-top: 8px; }
+.help-table th { background-color: #f1f5f9; color: #192442; text-align: left; padding: 8px 12px; border: 1px solid #cbd5e1; width: 24%; }
+.help-table td { padding: 8px 12px; border: 1px solid #e2e8f0; color: #334155; line-height: 1.5; }
 .formula-box {
-    background: #f8fafc;
-    border: 1px solid #cbd5e1;
-    border-left: 4px solid #192442;
-    padding: 10px 14px;
-    border-radius: 6px;
-    font-family: Consolas, monospace;
-    font-size: 0.88rem;
-    color: #0f172a;
-    margin: 8px 0;
+    background: #f8fafc; border: 1px solid #cbd5e1; border-left: 4px solid #192442;
+    padding: 10px 14px; border-radius: 6px; font-family: Consolas, monospace; font-size: 0.88rem; color: #0f172a; margin: 8px 0;
 }
 </style>
 """,
@@ -676,7 +395,6 @@ if q_horse.isdigit():
         except Exception:
             pass
 
-    # 次回のボタン操作（前の馬／次の馬／閉じる）が上書きされないようURLパラメータをクリア
     try:
         st.query_params.clear()
     except Exception:
@@ -1363,7 +1081,7 @@ with tab_main:
         st.code(ipat_data["ipat_csv"].strip(), language="text")
 
     # ==========================================================================
-    # 出走表 ＋ 右側インライン詳細パネル（FUJIAI風レイアウト）
+    # 出走表 ＋ 右側インライン詳細パネル
     # ==========================================================================
     valid_horse_nums = set(race_df["horse_num"].astype(int).tolist())
     sel_detail_h = st.session_state.get("selected_detail_horse")
@@ -1409,11 +1127,6 @@ with tab_main:
             on_change=_on_quick_horse_change,
             args=(quick_key, quick_opts[0]),
         )
-        if picked_q != quick_opts[0]:
-            picked_num = int(picked_q.split("|")[1].strip().split()[0])
-            if picked_num != sel_detail_h:
-                st.session_state["selected_detail_horse"] = picked_num
-                st.rerun()
 
     table_rows_html = []
     for _, r in race_df.iterrows():
