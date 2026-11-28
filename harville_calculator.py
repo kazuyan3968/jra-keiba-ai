@@ -235,8 +235,8 @@ def _rank_horses_for_bets(
 ) -> tuple[pd.DataFrame, set[int], set[int]]:
     """
     出走表の「印（◎○▲△☆＝AI上位5頭）」と買い目候補プールを厳密に連動させる。
-    ・堅実重視(solid): 印（◎○▲△☆＝AI上位5頭）のみを買い目対象とし、無印の超大穴を排除する。
-    ・標準バランス(balanced): 印（◎○▲△☆）を軸・相手の基本とし、相手はAI上位7頭（＋穴注目）まで。
+    ・堅実重視(solid): 印（◎○▲△☆＝AI上位5頭）のみを買い目対象とする。
+    ・標準バランス(balanced): 印（◎○▲△☆）を軸・相手の基本とし、相手はAI上位7頭（＋妙味馬）まで。
     ・穴狙い特化(upset): 印（◎○▲△☆）＋穴注目（単勝EV>=1.15かつAI上位9頭以内）を対象とする。
     """
     df = horses_df.copy()
@@ -291,7 +291,8 @@ def build_budget_mode_tickets(
 ) -> dict:
     """
     300円 / 500円 / 2000円モードの買い目を構築する（03_app.pyで200円モードも自動派生）。
-    出走表の「印（◎○▲△☆）」と買い目が一致するよう、印馬中心で買い目を組み立てる。
+    ・2頭軸は必ず出走表の「◎（AI1位）」と「○（AI2位）」に設定する。
+    ・相手5頭は「▲・△・☆」＋妙味馬から選び、馬番昇順で出力する。
     """
     pool, marked_nums, allowed_nums = _rank_horses_for_bets(
         horses_df=horses_df,
@@ -304,29 +305,12 @@ def build_budget_mode_tickets(
     odds_map = dict(zip(horses_df["horse_num"].astype(int), horses_df["win_odds"].astype(float)))
     prob_map = dict(zip(horses_df["horse_num"].astype(int), horses_df["pred_win_pct"].astype(float)))
 
+    # 2頭軸は常に「◎（最上位）」と「○（2番手）」で一致させる
     axis_1 = pool_nums[0]
-
-    mark_candidates = [h for h in pool_nums[1:] if h in marked_nums]
-    if not mark_candidates:
-        mark_candidates = pool_nums[1:5]
-
-    if style_mode == "solid":
-        axis_2 = mark_candidates[0]
-    elif style_mode == "upset":
-        cand_ax2 = [h for h in pool_nums[1:] if h in allowed_nums] or mark_candidates
-        axis_2 = max(
-            cand_ax2[:5],
-            key=lambda h: (prob_map[h] / 100.0) * min(odds_map[h], 40.0),
-        )
-    else:
-        top_marks = mark_candidates[:3]
-        axis_2 = max(
-            top_marks,
-            key=lambda h: ((prob_map[h] / 100.0) ** 0.7) * min(odds_map[h], 30.0),
-        )
-
+    axis_2 = pool_nums[1] if len(pool_nums) >= 2 else pool_nums[0]
     axis_list = [axis_1, axis_2]
 
+    # 相手5頭：残りの印（▲△☆）を優先し、スタイルに応じて妙味馬を補完して馬番順に並べる
     rem_marks = [h for h in pool_nums if h in marked_nums and h not in axis_list]
     rem_allowed = [h for h in pool_nums if h in allowed_nums and h not in axis_list and h not in rem_marks]
     rem_others = [h for h in pool_nums if h not in axis_list and h not in rem_marks and h not in rem_allowed]
