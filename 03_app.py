@@ -3,6 +3,7 @@ import importlib
 from importlib.util import module_from_spec, spec_from_file_location
 import html
 import os
+import re
 from urllib.parse import urlencode
 import joblib
 import numpy as np
@@ -40,7 +41,7 @@ spec_tracker.loader.exec_module(bet_tracker)
 st.set_page_config(page_title="KAZUYAN AI | 期待値＆買い目シミュレーター", layout="wide")
 
 # ==============================================================================
-# カスタムCSS（開催馬場ピルボタン・前R/次Rボタン・買い目タイル・出走表・右パネル）
+# カスタムCSS
 # ==============================================================================
 st.markdown(
     """
@@ -83,31 +84,74 @@ div[data-testid="stDeployButton"] { display: none; }
     font-size: 0.92rem !important; font-weight: 700 !important; white-space: nowrap !important;
 }
 
+/* レースヘッダーバナー（グレード別カラー） */
 .race-banner {
-    background: linear-gradient(135deg, #4a154b 0%, #611f54 60%, #3b123c 100%);
+    background: linear-gradient(135deg, #1e293b 0%, #334155 60%, #0f172a 100%);
     color: #ffffff; border-radius: 12px; padding: 18px 24px;
     display: flex; justify-content: space-between; align-items: center;
-    margin-top: 6px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(74, 21, 75, 0.25);
+    margin-top: 6px; margin-bottom: 18px; box-shadow: 0 4px 12px rgba(15, 23, 42, 0.22);
 }
+.race-banner-g1 {
+    background: linear-gradient(135deg, #fef08a 0%, #facc15 32%, #eab308 68%, #ca8a04 100%) !important;
+    color: #1c1917 !important;
+    border: 2px solid #fef9c3 !important;
+    box-shadow: 0 6px 20px rgba(234, 179, 8, 0.45) !important;
+}
+.race-banner-g1 .race-time { color: #713f12 !important; font-weight: 700 !important; }
+.race-banner-g1 .race-name-main { color: #1c1917 !important; text-shadow: 0 1px 0 rgba(255,255,255,0.55); }
+.race-banner-g1 .race-meta-row { color: #292524 !important; font-weight: 700 !important; }
+.race-banner-g1 .cond-badge { background-color: #1c1917 !important; color: #fde047 !important; }
+.race-banner-g2 {
+    background: linear-gradient(135deg, #881337 0%, #be123c 55%, #4c0519 100%) !important;
+    color: #ffffff !important;
+    border: 1.5px solid #fda4af !important;
+    box-shadow: 0 4px 14px rgba(190, 18, 60, 0.32) !important;
+}
+.race-banner-g3 {
+    background: linear-gradient(135deg, #065f46 0%, #047857 55%, #022c22 100%) !important;
+    color: #ffffff !important;
+    border: 1.5px solid #6ee7b7 !important;
+    box-shadow: 0 4px 14px rgba(4, 120, 87, 0.30) !important;
+}
+.race-banner-listed {
+    background: linear-gradient(135deg, #4a154b 0%, #611f54 60%, #3b123c 100%) !important;
+    color: #ffffff !important;
+    box-shadow: 0 4px 12px rgba(74, 21, 75, 0.25) !important;
+}
+
+.grade-pill-g1 {
+    background: linear-gradient(135deg, #1c1917 0%, #44403c 100%);
+    color: #fde047; border: 1.5px solid #fef08a;
+    font-size: 0.78rem; font-weight: 900; padding: 2px 10px; border-radius: 6px; letter-spacing: 0.06em;
+}
+.grade-pill-g2 {
+    background-color: #ffe4e6; color: #9f1239;
+    font-size: 0.78rem; font-weight: 900; padding: 2px 10px; border-radius: 6px;
+}
+.grade-pill-g3 {
+    background-color: #d1fae5; color: #065f46;
+    font-size: 0.78rem; font-weight: 900; padding: 2px 10px; border-radius: 6px;
+}
+
 .race-title-row { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
 .race-venue-r { font-size: 1.25rem; font-weight: 800; }
-.race-time { font-size: 0.88rem; color: #e9d5ff; }
-.race-name-main { font-size: 1.45rem; font-weight: 800; margin: 2px 0 8px 0; letter-spacing: 0.02em; }
+.race-time { font-size: 0.88rem; color: #e2e8f0; }
+.race-name-main { font-size: 1.48rem; font-weight: 900; margin: 2px 0 8px 0; letter-spacing: 0.02em; }
 .race-meta-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }
 .cond-badge { background-color: #fde68a; color: #78350f; font-weight: 700; padding: 2px 8px; border-radius: 4px; }
 .status-badge { background-color: #ecfdf5; color: #047857; border: 1px solid #10b981; font-weight: 700; padding: 2px 10px; border-radius: 5px; font-size: 0.78rem; }
 
 .ring-group { display: flex; gap: 14px; }
 .ring-circle {
-    width: 68px; height: 68px; border-radius: 50%; background: rgba(20, 12, 28, 0.55);
+    width: 68px; height: 68px; border-radius: 50%; background: rgba(20, 12, 28, 0.78);
     display: flex; flex-direction: column; justify-content: center; align-items: center;
-    box-shadow: inset 0 0 8px rgba(0,0,0,0.4);
+    box-shadow: inset 0 0 8px rgba(0,0,0,0.45);
 }
 .ring-orange { border: 3.5px solid #f59e0b; }
 .ring-green { border: 3.5px solid #10b981; }
 .ring-num-orange { font-size: 1.2rem; font-weight: 800; color: #fbbf24; line-height: 1.1; }
 .ring-num-green { font-size: 1.2rem; font-weight: 800; color: #34d399; line-height: 1.1; }
-.ring-label { font-size: 0.68rem; color: #f3e8ff; margin-top: 2px; }
+.ring-label { font-size: 0.68rem; color: #f8fafc; margin-top: 2px; }
 
 .mode-btn-zone + div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] > button {
     min-height: 84px !important; border-radius: 12px !important; padding: 12px 16px !important;
@@ -332,6 +376,20 @@ def _get_query_param(key: str, default: str = "") -> str:
         return default
 
 
+def _detect_banner_grade_style(race_title: str) -> tuple[str, str]:
+    """レース名からグレードを判定し、(追加CSSクラス, グレードバッジHTML) を返す"""
+    t = str(race_title or "")
+    if re.search(r"[\(（\[]\s*J\.?\s*G\s*1\s*[\)）\]]|[\(（\[]\s*G\s*[1ⅠI]\s*[\)）\]]", t, re.IGNORECASE):
+        return "race-banner race-banner-g1", '<span class="grade-pill-g1">G1 SPECIAL</span>'
+    if re.search(r"[\(（\[]\s*J\.?\s*G\s*2\s*[\)）\]]|[\(（\[]\s*G\s*[2Ⅱ]\s*[\)）\]]", t, re.IGNORECASE):
+        return "race-banner race-banner-g2", '<span class="grade-pill-g2">G2</span>'
+    if re.search(r"[\(（\[]\s*J\.?\s*G\s*3\s*[\)）\]]|[\(（\[]\s*G\s*[3Ⅲ]\s*[\)）\]]", t, re.IGNORECASE):
+        return "race-banner race-banner-g3", '<span class="grade-pill-g3">G3</span>'
+    if re.search(r"[\(（\[]\s*L\s*[\)）\]]|オープン|ステークス|S$", t.strip()):
+        return "race-banner race-banner-listed", ""
+    return "race-banner", ""
+
+
 # ==============================================================================
 # 馬名クリック（同一画面インライン表示）のクエリパラメータ復元処理
 # ==============================================================================
@@ -413,10 +471,6 @@ train_status = get_training_data_status(artifact, model_mtime)
 # サイドバー：開催日＆レース取得・設定
 # ==============================================================================
 st.sidebar.header("1. 開催日・データ取得")
-data_source = st.sidebar.radio(
-    "データ取得方法",
-    ["WebからJRA出馬表・オッズを自動取得", "ローカル / CSVアップロード"],
-)
 
 default_date_val = date.today()
 if st.session_state.get("fetched_race_date"):
@@ -425,55 +479,51 @@ if st.session_state.get("fetched_race_date"):
     except Exception:
         default_date_val = date.today()
 
-uploaded_file = None
-if data_source == "WebからJRA出馬表・オッズを自動取得":
-    target_date = st.sidebar.date_input("開催日を選択", value=default_date_val)
-    target_date_str = target_date.strftime("%Y-%m-%d")
+target_date = st.sidebar.date_input("開催日を選択", value=default_date_val)
+target_date_str = target_date.strftime("%Y-%m-%d")
 
-    if st.sidebar.button("開催レース一覧を取得", width="stretch"):
-        with st.spinner("開催レース一覧を取得中..."):
+if st.sidebar.button("開催レース一覧を取得", width="stretch"):
+    with st.spinner("開催レース一覧を取得中..."):
+        try:
+            _cached_fetch_race_list.clear()
+            races_found = _cached_fetch_race_list(target_date_str)
+            st.session_state["fetched_race_list"] = races_found
+            st.session_state["fetched_race_date"] = target_date_str
+            if not races_found:
+                st.sidebar.warning("指定日のJRA開催レースが見つかりませんでした。土日祝の日付を指定してください。")
+            else:
+                venues_avail = list(dict.fromkeys(r["venue"] for r in races_found))
+                first_v = venues_avail[0]
+                v_races = [r for r in races_found if r["venue"] == first_v]
+                default_r = next((r for r in v_races if r["race_num"] == 11), v_races[0])
+                load_race_into_session(default_r, target_date_str)
+                st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"一覧取得エラー: {e}")
+
+race_list = st.session_state.get("fetched_race_list", [])
+if race_list:
+    label_to_item = {item["label"]: item for item in race_list}
+    current_rid = st.session_state.get("selected_race_id")
+    labels_list = list(label_to_item.keys())
+    default_idx = 0
+    for idx_l, item in enumerate(race_list):
+        if item["race_id"] == current_rid:
+            default_idx = idx_l
+            break
+
+    selected_label = st.sidebar.selectbox("対象レース（または上のボタンで選択）", labels_list, index=default_idx)
+    if st.sidebar.button("選択レースの出馬表とオッズを取得", type="primary", width="stretch"):
+        sel_item = label_to_item[selected_label]
+        with st.spinner(f"{sel_item['venue']} {sel_item['race_num']}R を取得中..."):
             try:
-                _cached_fetch_race_list.clear()
-                races_found = _cached_fetch_race_list(target_date_str)
-                st.session_state["fetched_race_list"] = races_found
-                st.session_state["fetched_race_date"] = target_date_str
-                if not races_found:
-                    st.sidebar.warning("指定日のJRA開催レースが見つかりませんでした。土日祝の日付を指定してください。")
-                else:
-                    venues_avail = list(dict.fromkeys(r["venue"] for r in races_found))
-                    first_v = venues_avail[0]
-                    v_races = [r for r in races_found if r["venue"] == first_v]
-                    default_r = next((r for r in v_races if r["race_num"] == 11), v_races[0])
-                    load_race_into_session(default_r, target_date_str)
-                    st.rerun()
+                load_race_into_session(
+                    sel_item,
+                    st.session_state.get("fetched_race_date", target_date_str),
+                )
+                st.rerun()
             except Exception as e:
-                st.sidebar.error(f"一覧取得エラー: {e}")
-
-    race_list = st.session_state.get("fetched_race_list", [])
-    if race_list:
-        label_to_item = {item["label"]: item for item in race_list}
-        current_rid = st.session_state.get("selected_race_id")
-        labels_list = list(label_to_item.keys())
-        default_idx = 0
-        for idx_l, item in enumerate(race_list):
-            if item["race_id"] == current_rid:
-                default_idx = idx_l
-                break
-
-        selected_label = st.sidebar.selectbox("対象レース（または上のボタンで選択）", labels_list, index=default_idx)
-        if st.sidebar.button("選択レースの出馬表とオッズを取得", type="primary", width="stretch"):
-            sel_item = label_to_item[selected_label]
-            with st.spinner(f"{sel_item['venue']} {sel_item['race_num']}R を取得中..."):
-                try:
-                    load_race_into_session(
-                        sel_item,
-                        st.session_state.get("fetched_race_date", target_date_str),
-                    )
-                    st.rerun()
-                except Exception as e:
-                    st.sidebar.error(f"取得エラー: {e}")
-else:
-    uploaded_file = st.sidebar.file_uploader("出馬表CSV（任意）", type=["csv"])
+                st.sidebar.error(f"取得エラー: {e}")
 
 st.sidebar.header("2. 狙い方・バランス調整")
 style_options = [
@@ -516,9 +566,7 @@ ev_threshold = st.sidebar.slider(
     step=0.05,
 )
 
-with st.sidebar.expander("詳細フィルタ・手動オッズCSV"):
-    pair_odds_file = st.file_uploader("馬連・ワイド実オッズCSV", type=["csv"])
-    trio_odds_file = st.file_uploader("三連複実オッズCSV", type=["csv"])
+with st.sidebar.expander("詳細フィルタ"):
     min_win_prob = st.slider("単勝 最低予測勝率（%）", min_value=0.0, max_value=20.0, value=3.0, step=0.5)
     min_pair_prob = st.slider("馬連・ワイド 最低的中率（%）", min_value=0.0, max_value=15.0, value=1.5, step=0.5)
     min_trio_prob = st.slider("三連複 最低的中率（%）", min_value=0.0, max_value=5.0, value=0.4, step=0.1)
@@ -526,16 +574,14 @@ with st.sidebar.expander("詳細フィルタ・手動オッズCSV"):
     budget = st.number_input("詳細タブ 自由予算（円）", min_value=1000, max_value=100000, value=10000, step=1000)
 
 # 対象出馬表の決定
-if uploaded_file is not None:
-    race_df = pd.read_csv(uploaded_file)
-elif "active_race_df" in st.session_state:
+if "active_race_df" in st.session_state:
     race_df = st.session_state["active_race_df"].copy()
 else:
     race_df = pd.read_csv("data/upcoming_race.csv")
 
-pair_odds_df = pd.read_csv(pair_odds_file) if pair_odds_file is not None else st.session_state.get("auto_pair_odds_df")
+pair_odds_df = st.session_state.get("auto_pair_odds_df")
 exacta_odds_df = st.session_state.get("auto_exacta_odds_df")
-trio_odds_df = pd.read_csv(trio_odds_file) if trio_odds_file is not None else st.session_state.get("auto_trio_odds_df")
+trio_odds_df = st.session_state.get("auto_trio_odds_df")
 
 # 1. 単勝予測確率の算出
 feat_df, _ = train_model.create_features(race_df, category_maps=category_maps)
@@ -791,7 +837,7 @@ with tab_main:
             st.caption("※ 過去日や週末のレースを選ぶ場合は、左上の「>」からサイドバーを開いて開催日を選択してください。")
 
     # ==========================================================================
-    # レース情報バナー
+    # レース情報バナー（G1は黄金色・G2は紅・G3は緑・OP/Lは紫で自動切替）
     # ==========================================================================
     surface_short = "ダ" if "ダ" in str(r_info["surface"]) else "芝"
     race_title_display = (
@@ -817,6 +863,7 @@ with tab_main:
     max_ev_val = float(race_df["単勝期待値(EV)"].max())
     active_candidates = int((race_df["ai_rank"] <= 6).sum())
 
+    banner_cls, grade_pill_html = _detect_banner_grade_style(race_title_display)
     venue_esc = html.escape(str(r_info["venue"]))
     time_esc = html.escape(start_time_display)
     rtitle_esc = html.escape(race_title_display)
@@ -825,11 +872,12 @@ with tab_main:
     dist_i = int(r_info["distance"])
 
     banner_html = (
-        '<div class="race-banner">'
+        f'<div class="{banner_cls}">'
         '<div>'
         '<div class="race-title-row">'
         f'<span class="race-venue-r">{venue_esc} {race_num_label}</span>'
         f'<span class="race-time">{time_esc}</span>'
+        f'{grade_pill_html}'
         '</div>'
         f'<div class="race-name-main">{rtitle_esc}</div>'
         '<div class="race-meta-row">'
@@ -1565,7 +1613,7 @@ with tab_help:
         '<tr><td><strong>標準バランス（初期設定）</strong></td><td>三連複の「1頭目の軸」をAI予測上位4頭以内の実力馬から選び、「2頭目の軸と相手5頭」に期待値の高い中穴を絡める王道スタイルです。</td></tr>'
         '<tr><td><strong>堅実重視（的中率優先）</strong></td><td>軸2頭・BOX候補ともにAI実力上位馬に限定し、的中率の重みを強めて現実的な決着を狙います。</td></tr>'
         '<tr><td><strong>穴狙い特化（高配当EV優先）</strong></td><td>的中率よりも期待値（EV）の大きさを優先して高配当を狙います。</td></tr>'
-        '<tr><td><strong>AI独自度（初期値 75%）</strong></td><td>AI純粋確率（75%）と単勝オッズから逆算した市場評価（25%）を合成します。</td></tr>'
+        '<tr><td><strong>AI独自度（初期値 100%）</strong></td><td>AI純粋確率と単勝オッズから逆算した市場評価の合成比率を調整します。</td></tr>'
         '</tbody>'
         '</table>'
         '</div>'
