@@ -265,7 +265,7 @@ div[data-testid="stDeployButton"] { display: none; }
 
 @st.cache_resource
 def load_artifact(model_mtime: float):
-    return joblib.load("models/keiba_lgbm.pkl")
+    return train_model.load_model_artifact("models/keiba_lgbm.pkl")
 
 
 @st.cache_data(ttl=180, show_spinner=False)
